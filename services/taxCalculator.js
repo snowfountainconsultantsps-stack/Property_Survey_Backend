@@ -1,0 +1,217 @@
+// ════════════════════════════════════════════════════════════════
+// Property-tax engine — ARV (Annual Rental Value), unit-area method.
+//
+// The tax is derived transparently from the survey's own categorization:
+//   Property (type / subtype / construction / plot area)
+//     └─ Building
+//          └─ Floors (carpet area, use, occupancy)
+//               └─ Units (carpet area, occupancy)   ← multi-storey / complex
+//
+// For every taxable space:
+//   MRV (monthly)  = area(m²) × base_rate × construction_factor × occupancy_factor
+//   ARV (annual)   = MRV × 12
+// Tax heads are then a fraction of the total ARV.
+//
+// ⚠️  The numbers in TAX_CONFIG are TRANSPARENT DEFAULTS, not official notified
+//     rates. Adjust them to your ULB's rate schedule — every value is echoed
+//     back in the breakdown so the calculation is fully auditable.
+// ════════════════════════════════════════════════════════════════
+
+const ASSESSMENT_YEAR = "2025-26";
+
+const TAX_CONFIG = {
+  // Monthly rateable value per square metre, by how the space is used.
+  monthly_rate_per_sqm: {
+    RESIDENTIAL: 20,
+    COMMERCIAL: 60,
+    PARKING: 8,
+    VACANT_LAND: 5,
+  },
+  // Construction-quality multiplier (matched case-insensitively).
+  construction_factor: {
+    rcc: 1.0, pucca: 1.0, "semi-pucca": 0.8, "semi pucca": 0.8,
+    kutcha: 0.5, tin: 0.6, shed: 0.6, default: 1.0,
+  },
+  // Occupancy multiplier — rented space is rated higher (ARV method).
+  occupancy_factor: {
+    Self: 1.0, SelfRented: 1.25, Rented: 1.5, Vacant: 0.5, default: 1.0,
+  },
+  // Tax heads, each a fraction of the total ARV.
+  heads: [
+    { key: "house_tax", label: "House Tax", rate: 0.125, requires: null },
+    { key: "water_tax", label: "Water Tax", rate: 0.075, requires: null },
+    { key: "sewerage_tax", label: "Sewerage Tax", rate: 0.05, requires: "sewer" },
+    { key: "conservancy_tax", label: "Conservancy / Sanitation", rate: 0.05, requires: null },
+    { key: "education_cess", label: "Education Cess", rate: 0.02, requires: null },
+  ],
+  // Rebate on the total, for wholly self-occupied residential property.
+  self_occupied_rebate: 0.10,
+};
+
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+const round = (v) => Math.round(num(v) * 100) / 100;
+
+function constructionFactor(type) {
+  if (!type) return TAX_CONFIG.construction_factor.default;
+  const key = String(type).trim().toLowerCase();
+  return TAX_CONFIG.construction_factor[key] ?? TAX_CONFIG.construction_factor.default;
+}
+function occupancyFactor(status) {
+  return TAX_CONFIG.occupancy_factor[status] ?? TAX_CONFIG.occupancy_factor.default;
+}
+
+// Residential vs commercial for a given floor. Mixed-use puts shops on the
+// ground/basement and homes above — a documented assumption, not a rule.
+function usageFor(propertyType, floorNumber) {
+  if (propertyType === "NonResidential") return "COMMERCIAL";
+  if (propertyType === "Mixed") return num(floorNumber) <= 0 ? "COMMERCIAL" : "RESIDENTIAL";
+  return "RESIDENTIAL";
+}
+
+function floorLabel(n) {
+  n = num(n);
+  if (n === 0) return "Ground Floor";
+  if (n < 0) return `Basement ${Math.abs(n)}`;
+  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]} Floor`;
+}
+
+// ── Derive the list of taxable spaces from the property tree ──────
+function deriveSpaces(property) {
+  const spaces = [];
+  const construction = property.construction_type || null;
+  const building = property.Building;
+  const isMultiEntry = ["MultiStory", "CommercialComplex"].includes(property.property_subtype);
+
+  // Vacant land (or a plot with no building captured) → land tax only.
+  if (property.property_type === "Vacant" || !building) {
+    const area = num(property.plot_area);
+    if (area > 0) {
+      spaces.push({
+        label: "Vacant plot", usage: "VACANT_LAND", area_sqm: area,
+        occupancy: "Vacant", construction_type: construction,
+      });
+    }
+    return spaces;
+  }
+
+  const floors = building.Floors || [];
+
+  // Building with no floor detail — assess the whole built-up area as one space.
+  if (!floors.length) {
+    const area = num(building.total_builtup_area);
+    if (area > 0) {
+      spaces.push({
+        label: "Building", usage: usageFor(property.property_type, 0), area_sqm: area,
+        occupancy: building.building_occupancy || "Self", construction_type: construction,
+      });
+    }
+    return spaces;
+  }
+
+  for (const f of floors) {
+    const fno = f.floor_number;
+    // Parking floor → low parking rate.
+    if (f.floor_use === "Parking") {
+      const area = num(f.carpet_area);
+      if (area > 0) {
+        spaces.push({
+          label: `${floorLabel(fno)} · Parking`, usage: "PARKING", area_sqm: area,
+          occupancy: "Self", construction_type: construction,
+        });
+      }
+      continue;
+    }
+
+    const units = f.Units || [];
+    if (isMultiEntry && units.length) {
+      for (const u of units) {
+        const area = num(u.carpet_area);
+        if (area <= 0) continue;
+        spaces.push({
+          label: `${floorLabel(fno)} · Unit ${u.unit_number || u.id}`,
+          usage: usageFor(property.property_type, fno), area_sqm: area,
+          occupancy: u.occupancy_status || "Self", construction_type: construction,
+        });
+      }
+      continue;
+    }
+
+    // Single-entry floor: occupancy at floor / floor-occupancy / building level.
+    const occ = f.FloorOccupancy || {};
+    const area = num(f.carpet_area) || num(occ.carpet_area);
+    if (area <= 0) continue;
+    spaces.push({
+      label: floorLabel(fno),
+      usage: usageFor(property.property_type, fno), area_sqm: area,
+      occupancy: f.occupancy_status || occ.occupancy_status || building.building_occupancy || "Self",
+      construction_type: construction,
+    });
+  }
+  return spaces;
+}
+
+// ── Public: compute a full, auditable breakdown for one property ──
+function computeTax(property) {
+  const spaces = deriveSpaces(property).map((s) => {
+    const base = TAX_CONFIG.monthly_rate_per_sqm[s.usage] || 0;
+    const cf = s.usage === "VACANT_LAND" ? 1 : constructionFactor(s.construction_type);
+    const of = s.usage === "PARKING" || s.usage === "VACANT_LAND" ? 1 : occupancyFactor(s.occupancy);
+    const mrv_monthly = round(s.area_sqm * base * cf * of);
+    const arv = round(mrv_monthly * 12);
+    return { ...s, base_rate: base, construction_factor: cf, occupancy_factor: of, mrv_monthly, arv };
+  });
+
+  const arv_total = round(spaces.reduce((sum, s) => sum + s.arv, 0));
+  const hasSewer = !!property.sewer_connection;
+
+  const heads = TAX_CONFIG.heads.map((h) => {
+    const applicable = !h.requires || (h.requires === "sewer" && hasSewer);
+    return {
+      key: h.key, label: h.label, rate: h.rate, basis: "ARV",
+      applicable, amount: applicable ? round(arv_total * h.rate) : 0,
+    };
+  });
+
+  const subtotal = round(heads.reduce((sum, h) => sum + h.amount, 0));
+
+  // Self-occupied rebate only for wholly self-occupied residential property.
+  const whollySelf =
+    property.property_type === "Residential" &&
+    spaces.length > 0 &&
+    spaces.every((s) => ["Self", "Vacant"].includes(s.occupancy));
+  const rebate = {
+    rate: TAX_CONFIG.self_occupied_rebate,
+    amount: whollySelf ? round(subtotal * TAX_CONFIG.self_occupied_rebate) : 0,
+    reason: whollySelf ? "Wholly self-occupied residential" : null,
+  };
+
+  const total_annual = round(subtotal - rebate.amount);
+
+  return {
+    assessment_year: ASSESSMENT_YEAR,
+    method: "ARV (Annual Rental Value) — unit area",
+    property: {
+      id: property.id,
+      property_code: property.property_code || null,
+      property_type: property.property_type || null,
+      property_subtype: property.property_subtype || null,
+      construction_type: property.construction_type || null,
+      sewer_connection: hasSewer,
+    },
+    spaces,
+    arv_total,
+    heads,
+    subtotal,
+    rebate,
+    total_annual,
+    config: TAX_CONFIG,
+    notes: [
+      "MRV = area(m²) × base rate × construction factor × occupancy factor; ARV = MRV × 12.",
+      "Mixed-use assumes commercial on ground/basement and residential above.",
+      "Rates shown are configurable defaults — replace with your ULB's notified schedule.",
+    ],
+  };
+}
+
+module.exports = { computeTax, TAX_CONFIG, ASSESSMENT_YEAR };
