@@ -52,6 +52,14 @@ module.exports = (sequelize, DataTypes) => {
 
         survey_date: DataTypes.DATE,
 
+        // Answers to the category-specific questions defined in
+        // PropertyTypeConfig.attribute_schema (e.g. a petrol pump's canopy and
+        // forecourt areas). Kept as JSONB so adding a question is a data edit.
+        type_specific_attributes: {
+            type: DataTypes.JSONB,
+            defaultValue: {},
+        },
+
         // MultiStory & CommercialComplex can have multiple entries per polygon
         // Others are limited to one entry per polygon
         // This flag helps enforce that rule at application level

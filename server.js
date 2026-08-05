@@ -7,6 +7,7 @@ const { sequelize } = require("./models");
 const { errorHandler } = require("./middleware/errorHandler");
 const createDefaultAdmin = require("./config/createDefaultAdmin");
 const seedAssetCatalog = require("./config/seedAssetCatalog");
+const seedPropertyTypeConfig = require("./config/seedPropertyTypeConfig");
 
 // Route imports
 const authRoutes = require("./routes/authRoutes");
@@ -106,6 +107,33 @@ const startServer = async () => {
                 `ALTER TABLE "Projects" ADD COLUMN IF NOT EXISTS "${col}" INTEGER;`
             );
         }
+        // Hierarchy move: State → District → ULB → [Zone] → Ward → Locality.
+        // The ULB is now the operational parent (it defines wards and levies
+        // the tax); City is demoted to an optional label on the ULB. Old
+        // city_id columns are left in place so historic rows keep their value.
+        await sequelize.query('ALTER TABLE "Ulbs"  ADD COLUMN IF NOT EXISTS "district_id" INTEGER;');
+        await sequelize.query('ALTER TABLE "Ulbs"  ALTER COLUMN "city_id" DROP NOT NULL;');
+        await sequelize.query('ALTER TABLE "Zones" ADD COLUMN IF NOT EXISTS "ulb_id" INTEGER;');
+        await sequelize.query('ALTER TABLE "Zones" ALTER COLUMN "city_id" DROP NOT NULL;');
+        await sequelize.query('ALTER TABLE "Wards" ADD COLUMN IF NOT EXISTS "ulb_id" INTEGER;');
+        await sequelize.query('ALTER TABLE "Wards" ALTER COLUMN "city_id" DROP NOT NULL;');
+        for (const idx of [
+            ['ulbs_district_idx', '"Ulbs" (district_id)'],
+            ['zones_ulb_idx', '"Zones" (ulb_id)'],
+            ['wards_ulb_idx', '"Wards" (ulb_id)'],
+            ['localities_ward_idx', '"Localities" (ward_id)'],
+        ]) {
+            await sequelize.query(`CREATE INDEX IF NOT EXISTS "${idx[0]}" ON ${idx[1]};`).catch(() => {});
+        }
+
+        // Answers to the per-category questions defined in PropertyTypeConfig
+        // (e.g. a petrol pump's canopy/forecourt areas). JSONB so new questions
+        // never need another migration.
+        for (const tbl of ["Properties", "Units"]) {
+            await sequelize.query(
+                `ALTER TABLE "${tbl}" ADD COLUMN IF NOT EXISTS "type_specific_attributes" JSONB DEFAULT '{}'::jsonb;`
+            );
+        }
         console.log("✅ Additive column migrations applied.");
 
         // ── Digital-asset spatial columns + indexes ──────────────
@@ -170,12 +198,14 @@ const startServer = async () => {
             console.warn("⚠️  Zone tier migration skipped:", e.message);
         }
 
-        // ── Location-hierarchy boundaries (State/District/City/Zone/Ward) ──
+        // ── Location-hierarchy boundaries ────────────────────────
         // Same pattern as the digital-asset geometry columns above: raw,
         // additive, not declared in Sequelize — all I/O goes through
-        // services/locationGeo.js.
+        // services/locationGeo.js. Localities are included because a locality
+        // MAY carry a boundary (enabling spatial assignment); where no
+        // shapefile exists the column simply stays NULL and it's just a name.
         try {
-            for (const tbl of ["States", "Districts", "Cities", "Zones", "Wards"]) {
+            for (const tbl of ["States", "Districts", "Cities", "Ulbs", "Zones", "Wards", "Localities"]) {
                 await sequelize.query(
                     `ALTER TABLE "${tbl}" ADD COLUMN IF NOT EXISTS boundary geometry(Geometry, 4326);`
                 );
@@ -206,6 +236,7 @@ const startServer = async () => {
 
         await createDefaultAdmin();
         await seedAssetCatalog();
+        await seedPropertyTypeConfig();
 
         app.listen(PORT, () => {
             console.log(`🚀 Server running on port ${PORT}`);

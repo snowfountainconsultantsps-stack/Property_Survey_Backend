@@ -1,10 +1,17 @@
-const { sequelize, State, District, City, Zone, Ulb, Ward, Polygon } = require("../models");
+const { sequelize, State, District, City, Zone, Ulb, Ward, Locality, Polygon } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
 
 // ──────────────────────────────────────────────────────────────
-// Location hierarchy CRUD — State → District → City → Zone → Ward.
+// Location hierarchy CRUD.
 //
-// One generic implementation instead of five near-identical controllers:
+//   State → District → ULB → [Zone] → Ward → Locality
+//
+// The ULB is the operational parent (it defines wards and levies the tax);
+// City is a parallel, optional geographic label under District. Zone is an
+// optional tier used only by large corporations, so wards attach to the ULB
+// and merely reference a zone when one exists.
+//
+// One generic implementation instead of seven near-identical controllers:
 // each level differs only in its model, parent key, field names and sort.
 // ──────────────────────────────────────────────────────────────
 const LEVELS = {
@@ -26,6 +33,7 @@ const LEVELS = {
         order: [["name", "ASC"]],
         childOf: "states",
     },
+    // Geographic label only — not on the path to a ward.
     cities: {
         model: () => City,
         label: "City",
@@ -35,34 +43,43 @@ const LEVELS = {
         order: [["name", "ASC"]],
         childOf: "districts",
     },
-    zones: {
-        model: () => Zone,
-        label: "Zone",
-        parentKey: "city_id",
-        fields: ["name", "code", "city_id"],
-        required: ["name", "city_id"],
-        order: [["name", "ASC"]],
-        childOf: "cities",
-    },
     ulbs: {
         model: () => Ulb,
         label: "ULB",
-        parentKey: "city_id",
-        fields: ["name", "code", "ulb_type", "city_id"],
-        required: ["name", "city_id"],
+        parentKey: "district_id",
+        fields: ["name", "code", "ulb_type", "district_id", "city_id"],
+        required: ["name", "district_id"],
         order: [["name", "ASC"]],
-        childOf: "cities",
+        childOf: "districts",
+    },
+    zones: {
+        model: () => Zone,
+        label: "Zone",
+        parentKey: "ulb_id",
+        fields: ["name", "code", "ulb_id"],
+        required: ["name", "ulb_id"],
+        order: [["name", "ASC"]],
+        childOf: "ulbs",
     },
     wards: {
         model: () => Ward,
+        // Listed under the ULB. `zone_id` is optional and, when supplied, the
+        // ULB is derived from it (see resolveWardParents).
         label: "Ward",
-        // Zone is the real parent; city_id is kept as a denormalised shortcut
-        // and is derived from the zone on write (see resolveWardCity).
-        parentKey: "zone_id",
-        fields: ["ward_name", "ward_number", "zone_id", "city_id"],
-        required: ["ward_name", "zone_id"],
+        parentKey: "ulb_id",
+        fields: ["ward_name", "ward_number", "ulb_id", "zone_id"],
+        required: ["ward_name", "ulb_id"],
         order: [["ward_number", "ASC"]],
-        childOf: "zones",
+        childOf: "ulbs",
+    },
+    localities: {
+        model: () => Locality,
+        label: "Locality",
+        parentKey: "ward_id",
+        fields: ["name", "code", "locality_type", "alt_names", "pincode", "ward_id"],
+        required: ["name", "ward_id"],
+        order: [["name", "ASC"]],
+        childOf: "wards",
     },
 };
 
@@ -78,8 +95,12 @@ function levelConfig(level) {
     return cfg;
 }
 
-/** Wards carry a denormalised city_id — always derive it from the chosen zone. */
-async function resolveWardCity(body) {
+/**
+ * A ward may be created either directly under a ULB or under one of that
+ * ULB's zones. When a zone is given it wins, and the ULB is derived from it,
+ * so the two can never disagree.
+ */
+async function resolveWardParents(body) {
     if (!body.zone_id) return body;
     const zone = await Zone.findByPk(body.zone_id);
     if (!zone) {
@@ -87,7 +108,7 @@ async function resolveWardCity(body) {
         err.statusCode = 400;
         throw err;
     }
-    return { ...body, city_id: zone.city_id };
+    return { ...body, ulb_id: zone.ulb_id || body.ulb_id || null };
 }
 
 function pickFields(cfg, body) {
@@ -121,7 +142,7 @@ const createLocation = asyncHandler(async (req, res) => {
             .json({ success: false, message: `Missing required field(s): ${missing.join(", ")}.` });
     }
 
-    if (cfg.label === "Ward") body = await resolveWardCity(body);
+    if (cfg.label === "Ward") body = await resolveWardParents(body);
 
     const row = await cfg.model().create(body);
     res.status(201).json({ success: true, message: `${cfg.label} created.`, data: row });
@@ -135,7 +156,7 @@ const updateLocation = asyncHandler(async (req, res) => {
 
     let body = pickFields(cfg, req.body);
     if (req.body.is_active !== undefined) body.is_active = req.body.is_active;
-    if (cfg.label === "Ward" && body.zone_id) body = await resolveWardCity(body);
+    if (cfg.label === "Ward" && body.zone_id) body = await resolveWardParents(body);
 
     await row.update(body);
     res.status(200).json({ success: true, message: `${cfg.label} updated.`, data: row });
@@ -147,19 +168,27 @@ async function countDependents(level, id) {
         case "states":
             return { Districts: await District.count({ where: { state_id: id } }) };
         case "districts":
-            return { Cities: await City.count({ where: { district_id: id } }) };
-        case "cities":
             return {
-                Zones: await Zone.count({ where: { city_id: id } }),
-                ULBs: await Ulb.count({ where: { city_id: id } }),
-                Wards: await Ward.count({ where: { city_id: id } }),
+                Cities: await City.count({ where: { district_id: id } }),
+                ULBs: await Ulb.count({ where: { district_id: id } }),
+            };
+        // City is a label, not a parent — only the optional ULB link points at it.
+        case "cities":
+            return { ULBs: await Ulb.count({ where: { city_id: id } }) };
+        case "ulbs":
+            return {
+                Zones: await Zone.count({ where: { ulb_id: id } }),
+                Wards: await Ward.count({ where: { ulb_id: id } }),
             };
         case "zones":
             return { Wards: await Ward.count({ where: { zone_id: id } }) };
-        case "ulbs":
-            return {}; // Projects reference ULBs but shouldn't block archiving one.
         case "wards":
-            return { Polygons: await Polygon.count({ where: { ward_id: id } }) };
+            return {
+                Polygons: await Polygon.count({ where: { ward_id: id } }),
+                Localities: await Locality.count({ where: { ward_id: id } }),
+            };
+        case "localities":
+            return {};
         default:
             return {};
     }
@@ -197,13 +226,14 @@ const deleteLocation = asyncHandler(async (req, res) => {
 
 // GET /api/locations/tree — whole hierarchy in one call, for the admin manager
 const getLocationTree = asyncHandler(async (req, res) => {
-    const [states, districts, cities, zones, ulbs, wards] = await Promise.all([
+    const [states, districts, cities, ulbs, zones, wards, localities] = await Promise.all([
         State.findAll({ order: [["name", "ASC"]] }),
         District.findAll({ order: [["name", "ASC"]] }),
         City.findAll({ order: [["name", "ASC"]] }),
-        Zone.findAll({ order: [["name", "ASC"]] }),
         Ulb.findAll({ order: [["name", "ASC"]] }),
+        Zone.findAll({ order: [["name", "ASC"]] }),
         Ward.findAll({ order: [["ward_number", "ASC"]] }),
+        Locality.findAll({ order: [["name", "ASC"]] }),
     ]);
     res.status(200).json({
         success: true,
@@ -211,9 +241,10 @@ const getLocationTree = asyncHandler(async (req, res) => {
             states: states.map((s) => s.toJSON()),
             districts: districts.map((d) => d.toJSON()),
             cities: cities.map((c) => c.toJSON()),
-            zones: zones.map((z) => z.toJSON()),
             ulbs: ulbs.map((u) => u.toJSON()),
+            zones: zones.map((z) => z.toJSON()),
             wards: wards.map((w) => w.toJSON()),
+            localities: localities.map((l) => l.toJSON()),
         },
     });
 });

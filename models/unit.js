@@ -37,6 +37,13 @@ module.exports = (sequelize, DataTypes) => {
         },
 
         rent_amount: DataTypes.FLOAT,
+
+        // Per-unit answers to category-specific questions (see
+        // PropertyTypeConfig.attribute_schema).
+        type_specific_attributes: {
+            type: DataTypes.JSONB,
+            defaultValue: {},
+        },
     });
 
     return Unit;

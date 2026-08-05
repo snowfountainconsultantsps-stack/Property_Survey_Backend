@@ -26,6 +26,11 @@ const TAX_CONFIG = {
     COMMERCIAL: 60,
     PARKING: 8,
     VACANT_LAND: 5,
+    // Open/covered commercial areas that aren't enclosed floor space. A fuel
+    // station's value sits in its forecourt and canopy, not its small office,
+    // so these are rated separately from COMMERCIAL floor area.
+    CANOPY: 25,
+    FORECOURT: 6,
   },
   // Construction-quality multiplier (matched case-insensitively).
   construction_factor: {
@@ -74,6 +79,49 @@ function floorLabel(n) {
   if (n < 0) return `Basement ${Math.abs(n)}`;
   const s = ["th", "st", "nd", "rd"], v = n % 100;
   return `${n}${s[(v - 20) % 10] || s[v] || s[0]} Floor`;
+}
+
+// ── Spaces that come from the type-specific questionnaire ────────
+// Answers to PropertyTypeConfig.attribute_schema, stored on
+// Properties.type_specific_attributes. Only areas the floor/unit walk cannot
+// already see are added here, so nothing is counted twice: a complex's
+// basement parking, for instance, is already a Parking floor and is
+// deliberately NOT re-added from `basement_parking_area_sqm`.
+function deriveAttributeSpaces(property) {
+  const a = property.type_specific_attributes;
+  if (!a || typeof a !== "object") return [];
+
+  const construction = property.construction_type || null;
+  const spaces = [];
+  const add = (label, usage, area) => {
+    if (num(area) > 0) {
+      spaces.push({
+        label, usage, area_sqm: num(area),
+        occupancy: "Self", construction_type: construction, from_attributes: true,
+      });
+    }
+  };
+
+  const subtype = property.property_subtype;
+
+  if (subtype === "PetrolPump") {
+    // Without these a fuel station is rated only on its office cabin, which
+    // understates it by an order of magnitude.
+    add("Canopy (fuel dispensing)", "CANOPY", a.canopy_area_sqm);
+    add("Paved forecourt", "FORECOURT", a.forecourt_area_sqm);
+    if (a.has_convenience_store) add("Convenience store", "COMMERCIAL", a.store_area_sqm);
+    if (a.has_service_station) add("Service / washing bay", "COMMERCIAL", a.service_bay_area_sqm);
+  }
+
+  if (subtype === "Commercial" && a.has_mezzanine) {
+    add("Mezzanine", "COMMERCIAL", a.mezzanine_area_sqm);
+  }
+
+  if (property.property_type === "Vacant" && a.has_temporary_structure) {
+    add("Temporary structure", "COMMERCIAL", a.temporary_structure_area_sqm);
+  }
+
+  return spaces;
 }
 
 // ── Derive the list of taxable spaces from the property tree ──────
@@ -153,7 +201,7 @@ function deriveSpaces(property) {
 
 // ── Public: compute a full, auditable breakdown for one property ──
 function computeTax(property) {
-  const spaces = deriveSpaces(property).map((s) => {
+  const spaces = [...deriveSpaces(property), ...deriveAttributeSpaces(property)].map((s) => {
     const base = TAX_CONFIG.monthly_rate_per_sqm[s.usage] || 0;
     const cf = s.usage === "VACANT_LAND" ? 1 : constructionFactor(s.construction_type);
     const of = s.usage === "PARKING" || s.usage === "VACANT_LAND" ? 1 : occupancyFactor(s.occupancy);

@@ -31,6 +31,7 @@ const City = require("./city")(sequelize, DataTypes);
 const Zone = require("./zone")(sequelize, DataTypes);
 const Ulb = require("./ulb")(sequelize, DataTypes);
 const Ward = require("./ward")(sequelize, DataTypes);
+const Locality = require("./locality")(sequelize, DataTypes);
 
 // ──────────────────────────────────────────────────────────────
 // Import Models — Project (top-level container)
@@ -72,6 +73,9 @@ const UnitPhoto = require("./unitPhoto")(sequelize, DataTypes);
 // Tax assessment (computed from the survey; approved by an admin).
 const PropertyTaxAssessment = require("./propertyTaxAssessment")(sequelize, DataTypes);
 
+// Per-category survey shape + question schema (drives the wizard).
+const PropertyTypeConfig = require("./propertyTypeConfig")(sequelize, DataTypes);
+
 // ──────────────────────────────────────────────────────────────
 // Import Models — Digital Assets (drain / sewer / water / roads / etc.)
 // Generic layered GIS: Category → Layer → Feature, with an import batch
@@ -88,26 +92,43 @@ const AssetPhoto = require("./assetPhoto")(sequelize, DataTypes);
 // ASSOCIATIONS
 // ══════════════════════════════════════════════════════════════
 
-// ─── Location Hierarchy: State → District → City → Zone → Ward → Polygon ───
+// ─── Location Hierarchy ────────────────────────────────────────
+//   State → District → ULB → [Zone] → Ward → Locality → (Polygon)
+//
+// The ULB (not the City) is the operational parent: it is the authority that
+// defines wards and levies the tax. City remains as an optional geographic
+// label hanging off the ULB — see models/ulb.js.
 State.hasMany(District, { foreignKey: "state_id" });
 District.belongsTo(State, { foreignKey: "state_id" });
 
 District.hasMany(City, { foreignKey: "district_id" });
 City.belongsTo(District, { foreignKey: "district_id" });
 
-City.hasMany(Zone, { foreignKey: "city_id" });
-Zone.belongsTo(City, { foreignKey: "city_id" });
+// ULBs belong to a District; the City link is descriptive only.
+District.hasMany(Ulb, { foreignKey: "district_id" });
+Ulb.belongsTo(District, { foreignKey: "district_id" });
 
-// Urban Local Bodies also hang off a City (parallel to Zone).
 City.hasMany(Ulb, { foreignKey: "city_id" });
 Ulb.belongsTo(City, { foreignKey: "city_id" });
+
+// Zones divide a ULB (large corporations only — optional tier).
+Ulb.hasMany(Zone, { foreignKey: "ulb_id" });
+Zone.belongsTo(Ulb, { foreignKey: "ulb_id" });
+
+// Wards belong to the ULB directly; zone is an optional grouping.
+Ulb.hasMany(Ward, { foreignKey: "ulb_id" });
+Ward.belongsTo(Ulb, { foreignKey: "ulb_id" });
 
 Zone.hasMany(Ward, { foreignKey: "zone_id" });
 Ward.belongsTo(Zone, { foreignKey: "zone_id" });
 
-// Denormalised shortcut — see models/ward.js.
+// Legacy City→Ward shortcut, retained for historic rows.
 City.hasMany(Ward, { foreignKey: "city_id" });
 Ward.belongsTo(City, { foreignKey: "city_id" });
+
+// Localities sit inside a ward (non-statutory, optional).
+Ward.hasMany(Locality, { foreignKey: "ward_id" });
+Locality.belongsTo(Ward, { foreignKey: "ward_id" });
 
 Ward.hasMany(Polygon, { foreignKey: "ward_id" });
 Polygon.belongsTo(Ward, { foreignKey: "ward_id" });
@@ -257,6 +278,7 @@ module.exports = {
     Zone,
     Ulb,
     Ward,
+    Locality,
     // Survey
     User,
     Survey,
@@ -279,6 +301,8 @@ module.exports = {
     UnitPhoto,
     // Tax
     PropertyTaxAssessment,
+    // Survey configuration
+    PropertyTypeConfig,
     // Digital Assets
     AssetCategory,
     AssetLayer,

@@ -1,10 +1,14 @@
 /**
  * locationGeo.js
  *
- * Raw PostGIS SQL for the location-hierarchy boundary columns (State →
- * District → City → Zone → Ward), added additively in server.js. Same
- * convention as services/assetGeo.js: native WGS84 (EPSG:4326), all I/O in
- * raw SQL since the `boundary` column isn't declared on the Sequelize models.
+ * Raw PostGIS SQL for the location-hierarchy boundary columns
+ * (State → District → ULB → [Zone] → Ward → Locality), added additively in
+ * server.js. Same convention as services/assetGeo.js: native WGS84
+ * (EPSG:4326), all I/O in raw SQL since the `boundary` column isn't declared
+ * on the Sequelize models.
+ *
+ * LOCALITY boundaries are optional — supply a shapefile and properties can be
+ * matched to a locality by spatial join; leave it and the locality is a name.
  */
 const { QueryTypes } = require("sequelize");
 
@@ -12,8 +16,10 @@ const LEVELS = {
     STATE: { table: "States", nameCol: "name", codeCol: "code", parentCol: null, matchCols: ["name", "code"] },
     DISTRICT: { table: "Districts", nameCol: "name", codeCol: "code", parentCol: "state_id", matchCols: ["name", "code"] },
     CITY: { table: "Cities", nameCol: "name", codeCol: "code", parentCol: "district_id", matchCols: ["name", "code"] },
-    ZONE: { table: "Zones", nameCol: "name", codeCol: "code", parentCol: "city_id", matchCols: ["name", "code"] },
-    WARD: { table: "Wards", nameCol: "ward_name", codeCol: "ward_number", parentCol: "zone_id", matchCols: ["ward_name", "ward_number"] },
+    ULB: { table: "Ulbs", nameCol: "name", codeCol: "code", parentCol: "district_id", matchCols: ["name", "code"] },
+    ZONE: { table: "Zones", nameCol: "name", codeCol: "code", parentCol: "ulb_id", matchCols: ["name", "code"] },
+    WARD: { table: "Wards", nameCol: "ward_name", codeCol: "ward_number", parentCol: "ulb_id", matchCols: ["ward_name", "ward_number"] },
+    LOCALITY: { table: "Localities", nameCol: "name", codeCol: "code", parentCol: "ward_id", matchCols: ["name", "code", "alt_names"] },
 };
 
 const LEVEL_NAMES = Object.keys(LEVELS).join(", ");

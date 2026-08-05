@@ -35,6 +35,7 @@ const {
     Survey,
     Ward,
     User,
+    PropertyTypeConfig,
 } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { uploadBuffer } = require("../config/cloudinary");
@@ -110,6 +111,26 @@ const getSubtypes = asyncHandler(async (req, res) => {
         ? SUBTYPES.filter((s) => s.category_id === parseInt(category_id))
         : SUBTYPES;
     res.json({ success: true, data });
+});
+
+// GET /api/types/config[?category_id=&subtype_id=]
+// Returns the survey shape + question schema per property type. The app uses
+// this to decide which template to render and which extra questions to ask,
+// replacing the old `subtypeName.includes("complex")` string matching.
+const getTypeConfigs = asyncHandler(async (req, res) => {
+    const { category_id, subtype_id } = req.query;
+
+    const where = { is_active: true };
+    if (category_id) where.category_id = parseInt(category_id);
+    // subtype_id is absent for Mixed/Vacant, so only filter when given.
+    if (subtype_id) where.subtype_id = parseInt(subtype_id);
+
+    const configs = await PropertyTypeConfig.findAll({
+        where,
+        order: [["sort_order", "ASC"]],
+    });
+
+    res.json({ success: true, count: configs.length, data: configs });
 });
 
 const getFloorUsageTypes = asyncHandler(async (req, res) => {
@@ -212,6 +233,11 @@ const addPropertyDetails = asyncHandler(async (req, res) => {
         construction_type,
         plot_area_sqmt,
         utility_connections,
+        // Joint ownership: an array of owner objects. The singular fields above
+        // remain supported so older app builds keep working.
+        owners,
+        // Answers to this category's PropertyTypeConfig.attribute_schema.
+        type_specific_attributes,
         // Road sides
         road_type_front,  road_width_front,  carriageway_area_front,  footpath_area_front,
         road_type_back,   road_width_back,   carriageway_area_back,   footpath_area_back,
@@ -223,21 +249,44 @@ const addPropertyDetails = asyncHandler(async (req, res) => {
     await property.update({
         plot_area:        plot_area_sqmt ? parseFloat(plot_area_sqmt) : property.plot_area,
         construction_type: construction_type || property.construction_type,
+        type_specific_attributes:
+            type_specific_attributes && typeof type_specific_attributes === "object"
+                ? type_specific_attributes
+                : property.type_specific_attributes,
     });
 
-    // Owner (for single-entry types where owner is at property level)
-    if (owner_name) {
+    // Owners. Joint ownership is common (spouses, brothers), so an `owners`
+    // array is accepted; the legacy singular fields map to a one-element list.
+    const ownerList = Array.isArray(owners) && owners.length
+        ? owners
+        : owner_name
+            ? [{
+                owner_name,
+                father_or_husband_name: father_husband_name,
+                occupation: owner_occupation,
+                disabled_person: is_disabled_person === "YES",
+                mobile_number,
+                aadhar_number,
+                bill_photo: bill_photo_url,
+            }]
+            : [];
+
+    if (ownerList.length) {
         await PropertyOwner.destroy({ where: { property_id: property.id } });
-        await PropertyOwner.create({
-            property_id:         property.id,
-            owner_name,
-            father_or_husband_name: father_husband_name || null,
-            occupation:          owner_occupation     || null,
-            disabled_person:     is_disabled_person === "YES",
-            mobile_number:       mobile_number        || null,
-            aadhar_number:       aadhar_number        || null,
-            bill_photo:          bill_photo_url        || null,
-        });
+        for (const o of ownerList) {
+            if (!o || !o.owner_name) continue;
+            await PropertyOwner.create({
+                property_id:            property.id,
+                owner_name:             o.owner_name,
+                // Accept both the flat wizard names and the DB column names.
+                father_or_husband_name: o.father_or_husband_name || o.father_husband_name || null,
+                occupation:             o.occupation || o.owner_occupation || null,
+                disabled_person:        o.disabled_person === true || o.is_disabled_person === "YES",
+                mobile_number:          o.mobile_number || null,
+                aadhar_number:          o.aadhar_number || null,
+                bill_photo:             o.bill_photo || o.bill_photo_url || null,
+            });
+        }
     }
 
     // Utilities
@@ -358,6 +407,9 @@ const addUnit = asyncHandler(async (req, res) => {
         tenant_name,
         tenant_mobile,
         residential_details,
+        // Joint ownership of a single unit (flat/shop owned by 2+ people).
+        owners,
+        unit_number,
     } = req.body;
 
     // Find or create the floor automatically (for merged/sequential flows)
@@ -371,17 +423,34 @@ const addUnit = asyncHandler(async (req, res) => {
         });
     }
 
+    const attrs = residential_details?.type_specific_attributes || {};
+
     const unit = await Unit.create({
         floor_id:         floor.id,
+        unit_number:      unit_number || null,
         carpet_area:      carpet_area_sqmt ? parseFloat(carpet_area_sqmt) : null,
         occupancy_status: mapOccupancy(occupancy_status),
         occupant_name:    tenant_name  || null,
         occupant_mobile:  tenant_mobile || null,
+        type_specific_attributes: attrs,
     });
 
-    // Owner
-    const attrs = residential_details?.type_specific_attributes || {};
-    if (owner_name) {
+    // Owners — an `owners` array supports joint ownership; the singular
+    // owner_name path is kept for older app builds.
+    if (Array.isArray(owners) && owners.length) {
+        for (const o of owners) {
+            if (!o || !o.owner_name) continue;
+            await UnitOwner.create({
+                unit_id:                unit.id,
+                owner_name:             o.owner_name,
+                father_or_husband_name: o.father_or_husband_name || o.father_husband_name || null,
+                occupation:             o.occupation || o.owner_occupation || null,
+                mobile:                 o.mobile || o.mobile_number || null,
+                aadhar:                 o.aadhar || o.aadhar_number || null,
+                disabled_person:        o.disabled_person === true || o.is_disabled_person === "YES",
+            });
+        }
+    } else if (owner_name) {
         await UnitOwner.create({
             unit_id:               unit.id,
             owner_name,
@@ -655,6 +724,7 @@ module.exports = {
     getCategories,
     getSubtypes,
     getFloorUsageTypes,
+    getTypeConfigs,
     // Wizard
     createDraftSurvey,
     addPropertyDetails,
