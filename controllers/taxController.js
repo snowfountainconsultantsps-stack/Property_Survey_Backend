@@ -1,5 +1,5 @@
 const {
-    Property, PropertyUtilities, Building, Floor, Unit, FloorOccupancy,
+    Property, PropertyUtilities, Building, Floor, Unit, UnitOwner, FloorOccupancy,
     PropertyTaxAssessment,
 } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -29,9 +29,19 @@ async function buildProperty(propertyId) {
                     Unit.findAll({ where: { floor_id: f.id } }),
                     FloorOccupancy.findOne({ where: { floor_id: f.id } }),
                 ]);
+                // Owners are needed to split the demand per unit — a complex
+                // has one bill per owner, not one for the whole building.
+                const withOwners = await Promise.all(
+                    units.map(async (u) => ({
+                        ...u.toJSON(),
+                        UnitOwners: (
+                            await UnitOwner.findAll({ where: { unit_id: u.id } })
+                        ).map((o) => o.toJSON()),
+                    }))
+                );
                 return {
                     ...f.toJSON(),
-                    Units: units.map((u) => u.toJSON()),
+                    Units: withOwners,
                     FloorOccupancy: occ ? occ.toJSON() : null,
                 };
             })

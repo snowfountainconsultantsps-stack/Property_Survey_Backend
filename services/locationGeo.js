@@ -73,6 +73,44 @@ async function findIdByMatch(sequelize, level, matchCol, matchValue, parentId) {
     return rows[0]?.id || null;
 }
 
+/**
+ * Create one row at a level from imported attributes, returning its id.
+ * Used by the shapefile importer, which builds the hierarchy from the file
+ * rather than requiring it to be typed in first.
+ */
+async function createRow(sequelize, level, { name, code, parentId, extra = {} }, transaction) {
+    const { table, nameCol, codeCol, parentCol } = levelConfig(level);
+
+    const cols = [`"${nameCol}"`, `"is_active"`, `"createdAt"`, `"updatedAt"`];
+    const vals = [":name", "true", "NOW()", "NOW()"];
+    const repl = { name: String(name).trim() };
+
+    if (code !== undefined && code !== null && String(code).trim() !== "") {
+        cols.push(`"${codeCol}"`);
+        vals.push(":code");
+        repl.code = String(code).trim();
+    }
+    if (parentCol && parentId) {
+        cols.push(`"${parentCol}"`);
+        vals.push(":parentId");
+        repl.parentId = parentId;
+    }
+    // Level-specific extras (e.g. a ULB's ulb_type, a locality's pincode).
+    for (const [k, v] of Object.entries(extra)) {
+        if (v === undefined || v === null || String(v).trim() === "") continue;
+        cols.push(`"${k}"`);
+        vals.push(`:x_${k}`);
+        repl[`x_${k}`] = v;
+    }
+
+    const rows = await sequelize.query(
+        `INSERT INTO "${table}" (${cols.join(", ")}) VALUES (${vals.join(", ")}) RETURNING id`,
+        { replacements: repl, type: QueryTypes.INSERT, transaction }
+    );
+    // QueryTypes.INSERT returns [rows, rowCount] for Postgres RETURNING.
+    return rows?.[0]?.[0]?.id ?? null;
+}
+
 /** All rows at a level (optionally parent-scoped) that have a boundary, as a GeoJSON FeatureCollection. */
 async function getBoundaries(sequelize, level, parentId) {
     const { table, nameCol, codeCol, parentCol } = levelConfig(level);
@@ -98,4 +136,4 @@ async function getBoundaries(sequelize, level, parentId) {
     };
 }
 
-module.exports = { LEVELS, levelConfig, setBoundary, findIdByMatch, getBoundaries };
+module.exports = { LEVELS, levelConfig, setBoundary, findIdByMatch, createRow, getBoundaries };

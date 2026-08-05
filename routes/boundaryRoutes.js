@@ -5,6 +5,8 @@ const {
     getLevelBoundaries,
     uploadSingleBoundary,
     bulkUploadBoundaries,
+    previewBoundaryImport,
+    commitBoundaryImport,
 } = require("../controllers/boundaryController");
 
 const router = express.Router();
@@ -20,5 +22,10 @@ router.post("/:level/:id/upload", auth, GIS_ADMIN, uploadAssetFile.single("file"
 
 // POST /api/boundaries/:level/bulk-upload  — match many boundaries by name/code
 router.post("/:level/bulk-upload", auth, GIS_ADMIN, uploadAssetFile.single("file"), bulkUploadBoundaries);
+
+// Import the hierarchy FROM a shapefile (creates rows that don't exist yet).
+// preview → admin verifies exactly what will be created → commit.
+router.post("/:level/import/preview", auth, GIS_ADMIN, uploadAssetFile.single("file"), previewBoundaryImport);
+router.post("/:level/import/commit", auth, GIS_ADMIN, uploadAssetFile.single("file"), commitBoundaryImport);
 
 module.exports = router;

@@ -124,6 +124,20 @@ function deriveAttributeSpaces(property) {
   return spaces;
 }
 
+// Owners recorded against a unit. A single unit is often held jointly
+// (spouses, brothers) — that is ONE liability with several names on it, not
+// several bills, so joint owners are kept together as one group.
+function ownersOf(unit) {
+  const list = unit.UnitOwners || unit.unit_owners || [];
+  return list
+    .filter((o) => o && (o.owner_name || o.mobile))
+    .map((o) => ({
+      owner_name: o.owner_name || "Unnamed",
+      mobile: o.mobile || null,
+      father_or_husband_name: o.father_or_husband_name || null,
+    }));
+}
+
 // ── Derive the list of taxable spaces from the property tree ──────
 function deriveSpaces(property) {
   const spaces = [];
@@ -180,6 +194,11 @@ function deriveSpaces(property) {
           label: `${floorLabel(fno)} · Unit ${u.unit_number || u.id}`,
           usage: usageFor(property.property_type, fno), area_sqm: area,
           occupancy: u.occupancy_status || "Self", construction_type: construction,
+          // Carried through so the bill can be split per owner: in a flat or
+          // complex each unit is separately owned and separately liable.
+          unit_id: u.id ?? null,
+          unit_number: u.unit_number || null,
+          owners: ownersOf(u),
         });
       }
       continue;
@@ -197,6 +216,73 @@ function deriveSpaces(property) {
     });
   }
   return spaces;
+}
+
+// ── Split the bill by owner ───────────────────────────────────────
+// In a multi-storey building or commercial complex each unit is separately
+// owned, so a single building-wide figure is not a usable demand. Tax is
+// apportioned by each owner's share of the total ARV — exact, because every
+// head is itself a flat percentage of ARV, so proportional split and
+// per-owner recomputation give the same answer.
+//
+// Spaces with no unit owner (parking floors, common areas, a petrol pump's
+// canopy) are collected under "Building / common" rather than being silently
+// spread across owners.
+function ownerBreakdown(spaces, arvTotal, totalAnnual) {
+  const unitSpaces = spaces.filter((s) => s.unit_id != null);
+  if (!unitSpaces.length) return { owner_breakdown: null };
+
+  const groups = new Map();
+  const keyFor = (owners) =>
+    owners.length
+      ? owners.map((o) => `${o.owner_name}|${o.mobile || ""}`).sort().join(" + ")
+      : "__unassigned__";
+
+  for (const s of spaces) {
+    const owners = s.owners || [];
+    const isUnit = s.unit_id != null;
+    const key = isUnit ? keyFor(owners) : "__common__";
+    if (!groups.has(key)) {
+      groups.set(key, {
+        owners: isUnit ? owners : [],
+        is_common: !isUnit,
+        is_joint: isUnit && owners.length > 1,
+        unassigned: isUnit && owners.length === 0,
+        spaces: [],
+        arv: 0,
+      });
+    }
+    const g = groups.get(key);
+    g.spaces.push({
+      label: s.label, unit_number: s.unit_number || null, usage: s.usage,
+      area_sqm: s.area_sqm, occupancy: s.occupancy, arv: s.arv,
+    });
+    g.arv = round(g.arv + s.arv);
+  }
+
+  const out = [...groups.values()].map((g) => {
+    const share = arvTotal > 0 ? g.arv / arvTotal : 0;
+    return {
+      label: g.is_common
+        ? "Building / common areas"
+        : g.unassigned
+          ? "Owner not recorded"
+          : g.owners.map((o) => o.owner_name).join(" & "),
+      owners: g.owners,
+      is_common: g.is_common,
+      is_joint: g.is_joint,
+      unassigned: g.unassigned,
+      unit_count: g.spaces.filter((s) => s.unit_number !== null).length,
+      spaces: g.spaces,
+      arv: g.arv,
+      share_pct: Math.round(share * 1000) / 10,
+      tax: round(totalAnnual * share),
+    };
+  });
+
+  // Biggest liability first; common areas last so owners read as a list.
+  out.sort((a, b) => (a.is_common ? 1 : b.is_common ? -1 : b.tax - a.tax));
+  return { owner_breakdown: out };
 }
 
 // ── Public: compute a full, auditable breakdown for one property ──
@@ -237,6 +323,7 @@ function computeTax(property) {
   const total_annual = round(subtotal - rebate.amount);
 
   return {
+    ...ownerBreakdown(spaces, arv_total, total_annual),
     assessment_year: ASSESSMENT_YEAR,
     method: "ARV (Annual Rental Value) — unit area",
     property: {
