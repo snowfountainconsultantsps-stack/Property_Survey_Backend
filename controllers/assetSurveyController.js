@@ -8,6 +8,7 @@ const {
 } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { updateFeatureGeometry } = require("../services/assetGeo");
+const { isFeatureInScope } = require("../services/surveyorScope");
 const { uploadBuffer } = require("../config/cloudinary");
 
 // ──────────────────────────────────────────────────────────────
@@ -68,6 +69,15 @@ function coerceToSchema(properties, schema) {
 const submitSurvey = asyncHandler(async (req, res) => {
     const feature = await AssetFeature.findByPk(req.params.id);
     if (!feature) return res.status(404).json({ success: false, message: "Feature not found." });
+
+    // The allocation has to hold on write, not just on read — otherwise a
+    // surveyor could still submit against an asset in someone else's ward.
+    if (!(await isFeatureInScope(sequelize, req.user, feature.id))) {
+        return res.status(403).json({
+            success: false,
+            message: "This asset is outside your allocated area.",
+        });
+    }
 
     const {
         action,

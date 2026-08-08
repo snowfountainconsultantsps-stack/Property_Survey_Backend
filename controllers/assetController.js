@@ -8,6 +8,7 @@ const {
     Ward,
 } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { resolveScope, scopeClause, isFeatureInScope } = require("../services/surveyorScope");
 const {
     FEATURE_SELECT,
     FEATURE_SURVEY_STATUS,
@@ -171,6 +172,11 @@ const getLayerFeatures = asyncHandler(async (req, res) => {
     const bb = bboxClause(bbox, repl);
     if (bb) where.push(bb);
 
+    // Same allocation guard as the map — this endpoint returns a whole layer.
+    const layerScope = await resolveScope(sequelize, req.user);
+    const layerScoped = scopeClause(layerScope, "f", repl);
+    if (layerScoped) where.push(layerScoped.clause);
+
     const rows = await sequelize.query(
         `SELECT ${FEATURE_SELECT}, ${FEATURE_SURVEY_STATUS}
          FROM "AssetFeatures" f WHERE ${where.join(" AND ")} ORDER BY f.id`,
@@ -221,6 +227,13 @@ const getAssetMap = asyncHandler(async (req, res) => {
     }
     const bb = bboxClause(bbox, repl);
     if (bb) where.push(bb);
+
+    // A surveyor only ever sees their allocated area. Admin/supervisor/GIS
+    // roles are unrestricted; a surveyor with no assignment sees nothing
+    // (the clause resolves to FALSE) rather than the whole city.
+    const scope = await resolveScope(sequelize, req.user);
+    const scoped = scopeClause(scope, "f", repl);
+    if (scoped) where.push(scoped.clause);
 
     const baseLayer = (l, extra) => ({
         id: l.id,
@@ -313,6 +326,14 @@ const getFeatureById = asyncHandler(async (req, res) => {
         { replacements: { id: req.params.id }, type: QueryTypes.SELECT }
     );
     if (!rows.length) return res.status(404).json({ success: false, message: "Feature not found." });
+    // Ids are guessable, so the list filter alone wouldn't stop a surveyor
+    // opening an asset outside their allocated area.
+    if (!(await isFeatureInScope(sequelize, req.user, req.params.id))) {
+        return res.status(403).json({
+            success: false,
+            message: "This asset is outside your allocated area.",
+        });
+    }
     res.status(200).json({ success: true, data: rowToFeature(rows[0]) });
 });
 
@@ -337,6 +358,11 @@ const getNearbyFeatures = asyncHandler(async (req, res) => {
         where.push("f.project_id = :project_id");
         repl.project_id = project_id;
     }
+    // Proximity must not leak assets outside the surveyor's allocated area.
+    const nearScope = await resolveScope(sequelize, req.user);
+    const nearScoped = scopeClause(nearScope, "f", repl);
+    if (nearScoped) where.push(nearScoped.clause);
+
     const rows = await sequelize.query(
         `SELECT ${FEATURE_SELECT},
                 ST_Distance(f.geom::geography, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography) AS distance_m

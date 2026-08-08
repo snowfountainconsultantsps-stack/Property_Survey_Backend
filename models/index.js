@@ -33,6 +33,9 @@ const Ulb = require("./ulb")(sequelize, DataTypes);
 const Ward = require("./ward")(sequelize, DataTypes);
 const Locality = require("./locality")(sequelize, DataTypes);
 
+// Which areas a surveyor is allowed to work in (many-to-many).
+const SurveyorAssignment = require("./surveyorAssignment")(sequelize, DataTypes);
+
 // ──────────────────────────────────────────────────────────────
 // Import Models — Project (top-level container)
 // ──────────────────────────────────────────────────────────────
@@ -129,6 +132,19 @@ Ward.belongsTo(City, { foreignKey: "city_id" });
 // Localities sit inside a ward (non-statutory, optional).
 Ward.hasMany(Locality, { foreignKey: "ward_id" });
 Locality.belongsTo(Ward, { foreignKey: "ward_id" });
+
+// ─── Surveyor area assignments (many-to-many both ways) ────────
+User.hasMany(SurveyorAssignment, { foreignKey: "user_id", as: "assignments" });
+SurveyorAssignment.belongsTo(User, { foreignKey: "user_id", as: "surveyor" });
+
+Zone.hasMany(SurveyorAssignment, { foreignKey: "zone_id" });
+SurveyorAssignment.belongsTo(Zone, { foreignKey: "zone_id" });
+
+Ward.hasMany(SurveyorAssignment, { foreignKey: "ward_id" });
+SurveyorAssignment.belongsTo(Ward, { foreignKey: "ward_id" });
+
+Locality.hasMany(SurveyorAssignment, { foreignKey: "locality_id" });
+SurveyorAssignment.belongsTo(Locality, { foreignKey: "locality_id" });
 
 Ward.hasMany(Polygon, { foreignKey: "ward_id" });
 Polygon.belongsTo(Ward, { foreignKey: "ward_id" });
@@ -279,6 +295,7 @@ module.exports = {
     Ulb,
     Ward,
     Locality,
+    SurveyorAssignment,
     // Survey
     User,
     Survey,

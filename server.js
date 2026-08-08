@@ -21,6 +21,7 @@ const projectRoutes = require("./routes/projectRoutes");
 const boundaryRoutes = require("./routes/boundaryRoutes");
 const locationRoutes = require("./routes/locationRoutes");
 const taxRoutes = require("./routes/taxRoutes");
+const assignmentRoutes = require("./routes/assignmentRoutes");
 
 const app = express();
 
@@ -59,6 +60,7 @@ app.use("/api/projects", projectRoutes);
 app.use("/api/boundaries", boundaryRoutes);
 app.use("/api/locations", locationRoutes);
 app.use("/api/tax", taxRoutes);
+app.use("/api/assignments", assignmentRoutes);
 
 // ──────────────────────────────────────────────────────────────
 // 404 Handler
@@ -125,6 +127,12 @@ const startServer = async () => {
         ]) {
             await sequelize.query(`CREATE INDEX IF NOT EXISTS "${idx[0]}" ON ${idx[1]};`).catch(() => {});
         }
+
+        // Surveyor allocations gained an asset-type dimension: a grant is
+        // (project, area, layer) where layer NULL means every asset type.
+        await sequelize.query(
+            'ALTER TABLE "SurveyorAssignments" ADD COLUMN IF NOT EXISTS "layer_id" INTEGER;'
+        ).catch(() => {});
 
         // Answers to the per-category questions defined in PropertyTypeConfig
         // (e.g. a petrol pump's canopy/forecourt areas). JSONB so new questions
