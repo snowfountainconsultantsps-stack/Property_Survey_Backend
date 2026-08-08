@@ -54,6 +54,81 @@ async function setBoundary(sequelize, level, id, geometryOrGeometries, transacti
     );
 }
 
+// Which level spatially contains which, for auto-detecting a parent from
+// geometry instead of making the admin import one parent at a time.
+// WARD maps to ZONE (not ULB) because the zone is the finer of its two
+// parents; the ULB is then derived from the matched zone.
+const SPATIAL_PARENT = {
+    DISTRICT: "STATE",
+    CITY: "DISTRICT",
+    ULB: "DISTRICT",
+    ZONE: "ULB",
+    WARD: "ZONE",
+    LOCALITY: "WARD",
+};
+
+/**
+ * Find the parent row that geographically contains a child's geometry.
+ *
+ * Tests the child's interior point against parent boundaries first — cheap and
+ * robust to edges that don't line up exactly. Falls back to the parent with the
+ * largest overlap, which handles boundaries that disagree slightly (very common
+ * when the two layers come from different sources).
+ *
+ * Returns null when no parent has a boundary to test against, so callers can
+ * fall back to an explicitly chosen parent rather than guessing.
+ */
+async function findParentByGeometry(sequelize, childLevel, geometries) {
+    const parentLevel = SPATIAL_PARENT[String(childLevel || "").toUpperCase()];
+    if (!parentLevel) return null;
+
+    const { table, nameCol } = levelConfig(parentLevel);
+    const geoms = Array.isArray(geometries) ? geometries : [geometries];
+    if (!geoms.length) return null;
+
+    const repl = {};
+    const exprs = geoms.map((g, i) => {
+        repl[`g${i}`] = JSON.stringify(g);
+        return `ST_SetSRID(ST_GeomFromGeoJSON(:g${i}), 4326)`;
+    });
+    const childExpr =
+        exprs.length === 1 ? exprs[0] : `ST_Multi(ST_Collect(ARRAY[${exprs.join(", ")}]))`;
+
+    const rows = await sequelize.query(
+        `WITH child AS (SELECT ST_MakeValid(${childExpr}) AS g)
+         SELECT p.id, p."${nameCol}" AS name,
+                ST_Contains(p.boundary, ST_PointOnSurface(child.g)) AS contains_point,
+                ST_Area(ST_Intersection(p.boundary, child.g)) AS overlap
+         FROM "${table}" p, child
+         WHERE p.boundary IS NOT NULL AND ST_Intersects(p.boundary, child.g)
+         ORDER BY contains_point DESC, overlap DESC
+         LIMIT 1`,
+        { replacements: repl, type: QueryTypes.SELECT }
+    );
+
+    if (!rows.length) return null;
+    return {
+        level: parentLevel,
+        id: rows[0].id,
+        name: rows[0].name,
+        exact: rows[0].contains_point === true,
+    };
+}
+
+/**
+ * Whether a row already carries a boundary. Published boundaries are treated
+ * as final, so callers use this to refuse an overwrite rather than silently
+ * replacing verified geometry.
+ */
+async function hasBoundary(sequelize, level, id) {
+    const { table } = levelConfig(level);
+    const rows = await sequelize.query(
+        `SELECT 1 FROM "${table}" WHERE id = :id AND boundary IS NOT NULL LIMIT 1`,
+        { replacements: { id }, type: QueryTypes.SELECT }
+    );
+    return rows.length > 0;
+}
+
 /** Find a row's id by matching name/code (case-insensitive), optionally scoped to a parent id. */
 async function findIdByMatch(sequelize, level, matchCol, matchValue, parentId) {
     const { table, parentCol, matchCols } = levelConfig(level);
@@ -136,4 +211,7 @@ async function getBoundaries(sequelize, level, parentId) {
     };
 }
 
-module.exports = { LEVELS, levelConfig, setBoundary, findIdByMatch, createRow, getBoundaries };
+module.exports = {
+    LEVELS, levelConfig, setBoundary, findIdByMatch, createRow, hasBoundary, getBoundaries,
+    SPATIAL_PARENT, findParentByGeometry,
+};

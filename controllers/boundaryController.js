@@ -2,8 +2,19 @@ const { sequelize } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { parseUpload } = require("../services/shapefileService");
 const {
-    setBoundary, findIdByMatch, createRow, getBoundaries, levelConfig,
+    setBoundary, findIdByMatch, createRow, hasBoundary, getBoundaries, levelConfig,
+    SPATIAL_PARENT, findParentByGeometry,
 } = require("../services/locationGeo");
+
+// A ward's real parent is its ULB, but wards are matched spatially to a ZONE.
+// Resolve the owning ULB from the matched zone so both columns stay consistent.
+async function ulbOfZone(sequelize, zoneId) {
+    const rows = await sequelize.query(`SELECT ulb_id FROM "Zones" WHERE id = :id`, {
+        replacements: { id: zoneId },
+        type: require("sequelize").QueryTypes.SELECT,
+    });
+    return rows[0]?.ulb_id ?? null;
+}
 
 const isPolygon = (f) => f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon";
 
@@ -26,6 +37,19 @@ const uploadSingleBoundary = asyncHandler(async (req, res) => {
     const { level, id } = req.params;
     if (!req.file) {
         return res.status(400).json({ success: false, message: "No file uploaded (field name 'file')." });
+    }
+
+    // Once published a boundary is final. Refuse here as well as in the UI —
+    // hiding the button alone would leave the endpoint open.
+    try {
+        if (await hasBoundary(sequelize, level, id)) {
+            return res.status(409).json({
+                success: false,
+                message: "This boundary is already published and cannot be changed.",
+            });
+        }
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
     }
 
     let parsed;
@@ -144,6 +168,34 @@ const bulkUploadBoundaries = asyncHandler(async (req, res) => {
 // stateless — no staging table to populate, expire and clean up.
 // ════════════════════════════════════════════════════════════════
 
+// Thin a ring down for on-screen preview. A state outline can carry tens of
+// thousands of vertices, which is far more than a verification map needs and
+// would make the preview response enormous.
+function decimateRing(ring, maxPoints) {
+    if (!Array.isArray(ring) || ring.length <= maxPoints) return ring;
+    const step = Math.ceil(ring.length / maxPoints);
+    const out = ring.filter((_, i) => i % step === 0);
+    // Keep the ring closed — a dropped last point would render as a gap.
+    const first = ring[0];
+    const last = out[out.length - 1];
+    if (first && last && (first[0] !== last[0] || first[1] !== last[1])) out.push(first);
+    return out;
+}
+
+function simplifyGeometry(geom, maxPoints = 400) {
+    if (!geom) return null;
+    if (geom.type === "Polygon") {
+        return { type: "Polygon", coordinates: geom.coordinates.map((r) => decimateRing(r, maxPoints)) };
+    }
+    if (geom.type === "MultiPolygon") {
+        return {
+            type: "MultiPolygon",
+            coordinates: geom.coordinates.map((poly) => poly.map((r) => decimateRing(r, maxPoints))),
+        };
+    }
+    return geom;
+}
+
 /** Parse the upload and group polygons by the chosen name attribute. */
 async function parseAndGroup(file, nameField, codeField) {
     const parsed = await parseUpload(file.buffer, {
@@ -200,13 +252,9 @@ const previewBoundaryImport = asyncHandler(async (req, res) => {
     } catch (err) {
         return res.status(400).json({ success: false, message: err.message });
     }
-    if (cfg.parentCol && !parent_id) {
-        return res.status(400).json({
-            success: false,
-            message: `A parent must be selected before importing ${cfg.table}.`,
-        });
-    }
-
+    // No parent needed up front: each row's parent is detected from its own
+    // geometry (findParentByGeometry). An explicitly chosen parent is used only
+    // as a fallback where detection can't decide.
     let out;
     try {
         out = await parseAndGroup(req.file, name_field, code_field);
@@ -230,18 +278,68 @@ const previewBoundaryImport = asyncHandler(async (req, res) => {
 
     // Step 2 — field chosen: show precisely what would be created vs updated.
     const pid = parent_id ? Number(parent_id) : null;
+    const parentLevel = SPATIAL_PARENT[String(level).toUpperCase()] || null;
     const rows = [];
     for (const g of out.groups.values()) {
-        const existingId = await findIdByMatch(sequelize, level, cfg.nameCol, g.name, pid);
+        // Which parent does this shape actually sit inside?
+        let detected = null;
+        if (parentLevel) {
+            try {
+                detected = await findParentByGeometry(sequelize, level, g.geometries);
+            } catch {
+                detected = null; // treated as "couldn't decide"
+            }
+        }
+        const effectiveParent = detected?.id ?? pid ?? null;
+        const parentSource = detected ? "detected" : pid ? "selected" : "none";
+
+        const existingId = await findIdByMatch(sequelize, level, cfg.nameCol, g.name, effectiveParent);
+        // A published boundary is final — reported as locked and skipped rather
+        // than quietly overwritten.
+        const locked = existingId ? await hasBoundary(sequelize, level, existingId) : false;
+
         rows.push({
             name: g.name,
             code: g.code,
             parts: g.geometries.length,
             existing_id: existingId,
-            action: existingId ? "update" : "create",
+            parent_level: parentLevel,
+            parent_id: effectiveParent,
+            parent_name: detected?.name || null,
+            // exact = the shape's interior point falls inside the parent;
+            // otherwise it was matched on largest overlap, worth reviewing.
+            parent_exact: detected ? detected.exact : null,
+            parent_source: parentSource,
+            action: locked
+                ? "locked"
+                : parentLevel && parentSource === "none"
+                    ? "no_parent"
+                    : existingId
+                        ? "update"
+                        : "create",
         });
     }
     rows.sort((a, b) => a.name.localeCompare(b.name));
+
+    // Simplified shapes so the admin can SEE what they're importing before it
+    // is written — a name list alone doesn't catch a wrong or misaligned file.
+    const preview = {
+        type: "FeatureCollection",
+        features: [...out.groups.values()].map((g) => ({
+            type: "Feature",
+            properties: { name: g.name, code: g.code },
+            geometry:
+                g.geometries.length === 1
+                    ? simplifyGeometry(g.geometries[0])
+                    : {
+                        type: "MultiPolygon",
+                        coordinates: g.geometries.flatMap((geom) => {
+                            const s = simplifyGeometry(geom);
+                            return s.type === "Polygon" ? [s.coordinates] : s.coordinates;
+                        }),
+                    },
+        })),
+    };
 
     res.status(200).json({
         success: true,
@@ -250,10 +348,16 @@ const previewBoundaryImport = asyncHandler(async (req, res) => {
             feature_count: out.polygons.length,
             fields: out.fields,
             rows,
+            preview,
+            parent_level: parentLevel,
             summary: {
                 total: rows.length,
                 create: rows.filter((r) => r.action === "create").length,
                 update: rows.filter((r) => r.action === "update").length,
+                locked: rows.filter((r) => r.action === "locked").length,
+                no_parent: rows.filter((r) => r.action === "no_parent").length,
+                auto_matched: rows.filter((r) => r.parent_source === "detected").length,
+                inexact: rows.filter((r) => r.parent_source === "detected" && !r.parent_exact).length,
             },
         },
     });
@@ -277,13 +381,9 @@ const commitBoundaryImport = asyncHandler(async (req, res) => {
     } catch (err) {
         return res.status(400).json({ success: false, message: err.message });
     }
-    if (cfg.parentCol && !parent_id) {
-        return res.status(400).json({
-            success: false,
-            message: `A parent must be selected before importing ${cfg.table}.`,
-        });
-    }
-
+    // No parent needed up front: each row's parent is detected from its own
+    // geometry (findParentByGeometry). An explicitly chosen parent is used only
+    // as a fallback where detection can't decide.
     let out;
     try {
         out = await parseAndGroup(req.file, name_field, code_field);
@@ -306,6 +406,10 @@ const commitBoundaryImport = asyncHandler(async (req, res) => {
     const created = [];
     const updated = [];
     const skipped = [];
+    const locked = [];
+    const noParent = [];
+    const levelUpper = String(level).toUpperCase();
+    const parentLevel = SPATIAL_PARENT[levelUpper] || null;
 
     // All-or-nothing: a half-imported hierarchy is worse than none.
     const t = await sequelize.transaction();
@@ -315,18 +419,54 @@ const commitBoundaryImport = asyncHandler(async (req, res) => {
                 skipped.push(g.name);
                 continue;
             }
-            let id = await findIdByMatch(sequelize, level, cfg.nameCol, g.name, pid);
+
+            // Each row gets the parent its own geometry falls inside, so one
+            // file covering many zones lands correctly in all of them.
+            let detected = null;
+            if (parentLevel) {
+                try {
+                    detected = await findParentByGeometry(sequelize, level, g.geometries);
+                } catch {
+                    detected = null;
+                }
+            }
+            const effectiveParent = detected?.id ?? pid ?? null;
+            if (parentLevel && !effectiveParent) {
+                noParent.push(g.name);
+                continue;
+            }
+
+            // A ward is matched to a zone, but its own FK is the ULB — derive
+            // it so zone_id and ulb_id can never disagree.
+            let parentId = effectiveParent;
+            const extra = {};
+            if (levelUpper === "WARD" && detected?.level === "ZONE") {
+                extra.zone_id = detected.id;
+                parentId = (await ulbOfZone(sequelize, detected.id)) ?? pid ?? null;
+                if (!parentId) {
+                    noParent.push(g.name);
+                    continue;
+                }
+            }
+
+            let id = await findIdByMatch(sequelize, level, cfg.nameCol, g.name, effectiveParent);
             if (id) {
+                // Published boundaries are immutable — refuse rather than
+                // overwrite geometry someone has already verified.
+                if (await hasBoundary(sequelize, level, id)) {
+                    locked.push(g.name);
+                    continue;
+                }
                 await setBoundary(sequelize, level, id, g.geometries, t);
-                updated.push({ id, name: g.name });
+                updated.push({ id, name: g.name, parent: detected?.name || null });
             } else {
                 id = await createRow(
                     sequelize, level,
-                    { name: g.name, code: g.code, parentId: pid },
+                    { name: g.name, code: g.code, parentId, extra },
                     t
                 );
                 await setBoundary(sequelize, level, id, g.geometries, t);
-                created.push({ id, name: g.name });
+                created.push({ id, name: g.name, parent: detected?.name || null });
             }
         }
         await t.commit();
@@ -340,8 +480,11 @@ const commitBoundaryImport = asyncHandler(async (req, res) => {
 
     res.status(200).json({
         success: true,
-        message: `Imported ${created.length} new and updated ${updated.length} ${cfg.table}.`,
-        data: { created, updated, skipped },
+        message:
+            `Published ${created.length} new and ${updated.length} updated ${cfg.table}.` +
+            (locked.length ? ` ${locked.length} already published and left unchanged.` : "") +
+            (noParent.length ? ` ${noParent.length} skipped — no containing ${parentLevel?.toLowerCase() || "parent"} found.` : ""),
+        data: { created, updated, skipped, locked, no_parent: noParent },
     });
 });
 
