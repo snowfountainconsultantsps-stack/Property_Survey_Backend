@@ -236,4 +236,29 @@ function summarise(matches) {
     };
 }
 
-module.exports = { matchAreas, rematchFeatures, summarise, projectScope };
+/**
+ * Area filters (zone / ward / locality) for any query over "AssetFeatures",
+ * pushed onto a WHERE list. Shared by the map, the layer/staged feature reads
+ * and the per-layer stats so "filtered by ward 5" means the same everywhere.
+ *
+ * Because every feature carries all three ids, a zone filter doesn't have to
+ * expand the zone into its wards first — which also means it still works for a
+ * feature whose ward boundary is missing.
+ *
+ * `source` is any object with zone_id / ward_id / locality_id keys (req.query,
+ * req.body, or a plain object). Comma-separated ids are accepted so the UI can
+ * filter by several areas at once.
+ */
+function areaFilters(source = {}, where, repl, alias = "f") {
+    for (const col of ["zone_id", "ward_id", "locality_id"]) {
+        const value = source[col];
+        if (value === undefined || value === null || value === "") continue;
+        const ids = String(value).split(",").map((v) => Number(v.trim())).filter(Number.isFinite);
+        if (!ids.length) continue;
+        where.push(`${alias}.${col} IN (:${col})`);
+        repl[col] = ids;
+    }
+    return where;
+}
+
+module.exports = { matchAreas, rematchFeatures, summarise, projectScope, areaFilters };

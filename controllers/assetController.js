@@ -19,7 +19,7 @@ const {
     rowToFeature,
 } = require("../services/assetGeo");
 const { createPolygonFromFeature } = require("../services/polygonGeo");
-const { matchAreas, rematchFeatures } = require("../services/areaMatch");
+const { matchAreas, rematchFeatures, areaFilters } = require("../services/areaMatch");
 
 // ──────────────────────────────────────────────────────────────
 // Helpers
@@ -37,26 +37,6 @@ function bboxClause(bbox, repl) {
     return "ST_Intersects(f.geom, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))";
 }
 
-/**
- * Area filters (zone / ward / locality), pushed onto a WHERE list.
- *
- * Every feature is stamped with all three at import time
- * (services/areaMatch.js), so filtering by zone doesn't have to expand the
- * zone into its wards first — which also means a zone filter still works for
- * a feature whose ward boundary is missing.
- */
-function areaFilters(query = {}, where, repl) {
-    for (const col of ["zone_id", "ward_id", "locality_id"]) {
-        const value = query[col];
-        if (value === undefined || value === null || value === "") continue;
-        // Comma-separated ids are accepted so the UI can filter by several
-        // wards at once without N requests.
-        const ids = String(value).split(",").map((v) => Number(v.trim())).filter(Number.isFinite);
-        if (!ids.length) continue;
-        where.push(`f.${col} IN (:${col})`);
-        repl[col] = ids;
-    }
-}
 
 // ══════════════════════════════════════════════════════════════
 // CATALOG — categories & layers

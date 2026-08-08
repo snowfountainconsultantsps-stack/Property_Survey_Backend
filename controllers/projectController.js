@@ -77,8 +77,17 @@ const getProjectSummary = asyncHandler(async (req, res) => {
     const project = await Project.findByPk(req.params.id);
     if (!project) return res.status(404).json({ success: false, message: "Project not found." });
 
+    // The same zone/ward/locality filter the map takes, so the tiles beside a
+    // filtered map count the same features the map is showing.
+    const area = {
+        zone_id: req.query.zone_id,
+        ward_id: req.query.ward_id,
+        locality_id: req.query.locality_id,
+    };
+    const filtered = Object.values(area).some((v) => v !== undefined && v !== null && v !== "");
+
     const [stats, uploads] = await Promise.all([
-        loadStats(null, project.id),
+        loadStats(area, project.id),
         AssetUpload.count({ where: { project_id: project.id } }),
     ]);
 
@@ -95,7 +104,7 @@ const getProjectSummary = asyncHandler(async (req, res) => {
 
     res.status(200).json({
         success: true,
-        data: { project, uploads, totals, by_layer: stats },
+        data: { project, uploads, totals, by_layer: stats, filtered, area },
     });
 });
 

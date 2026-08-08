@@ -3,6 +3,7 @@ const { QueryTypes } = require("sequelize");
 const { sequelize, Ward } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { writeDesignDoc, writeWardReport } = require("../services/pdfService");
+const { areaFilters } = require("../services/areaMatch");
 
 function streamPdf(res, filename, writer) {
     const doc = new PDFDocument({ size: "A4", margin: 48, bufferPages: true });
@@ -20,13 +21,14 @@ const getDesignDoc = asyncHandler(async (req, res) => {
 
 // Per-layer inventory stats, optionally scoped to a ward and/or project.
 // (Shared with getAssetStats and the project summary.)
-async function loadStats(wardId, projectId) {
+// `area` is either a ward id (legacy callers) or { zone_id, ward_id,
+// locality_id } — the same filter shape the map and feature endpoints take, so
+// a filtered map and the totals beside it always agree.
+async function loadStats(area, projectId) {
     const repl = {};
-    const filters = [];
-    if (wardId) {
-        filters.push("AND f.ward_id = :ward_id");
-        repl.ward_id = wardId;
-    }
+    const clauses = [];
+    areaFilters(area && typeof area === "object" ? area : { ward_id: area }, clauses, repl);
+    const filters = clauses.map((c) => `AND ${c}`);
     if (projectId) {
         filters.push("AND f.project_id = :project_id");
         repl.project_id = projectId;

@@ -3,7 +3,7 @@ const { sequelize, AssetLayer, AssetUpload, AssetFeature, Project, Ward } = requ
 const { asyncHandler } = require("../middleware/errorHandler");
 const { parseUpload, GEOM_FAMILY } = require("../services/shapefileService");
 const { FEATURE_SELECT, insertFeaturesBulk, toFeatureCollection } = require("../services/assetGeo");
-const { matchAreas, rematchFeatures, summarise } = require("../services/areaMatch");
+const { matchAreas, rematchFeatures, summarise, areaFilters } = require("../services/areaMatch");
 
 // Common .dbf/GeoJSON property keys that tend to hold an asset reference code.
 const CODE_KEYS = ["feature_code", "code", "asset_code", "ref", "name", "id_no", "gid", "objectid", "fid"];
@@ -223,13 +223,33 @@ const getUpload = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true, data: upload });
 });
 
-// GET /api/assets/uploads/:id/features  → staged features as GeoJSON (for map review)
+// GET /api/assets/uploads/:id/features?zone_id=&ward_id=&locality_id=
+// Staged features as GeoJSON, for reviewing a batch on the map. The area
+// filters let a reviewer check one ward at a time instead of eyeballing a
+// whole ULB's import at once.
 const getUploadFeatures = asyncHandler(async (req, res) => {
+    const where = ["f.upload_id = :id", "f.is_active = true"];
+    const repl = { id: req.params.id };
+    areaFilters(req.query, where, repl);
+
     const rows = await sequelize.query(
-        `SELECT ${FEATURE_SELECT} FROM "AssetFeatures" f WHERE f.upload_id = :id AND f.is_active = true ORDER BY f.id`,
+        `SELECT ${FEATURE_SELECT} FROM "AssetFeatures" f WHERE ${where.join(" AND ")} ORDER BY f.id`,
+        { replacements: repl, type: QueryTypes.SELECT }
+    );
+
+    // What the batch actually spans, so the reviewer's filter only offers areas
+    // that have features in it (and reveals when a batch is stamped nowhere).
+    const [spread] = await sequelize.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE ward_id IS NULL)::int AS unmatched,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT zone_id), NULL)     AS zone_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT ward_id), NULL)     AS ward_ids,
+                ARRAY_REMOVE(ARRAY_AGG(DISTINCT locality_id), NULL) AS locality_ids
+         FROM "AssetFeatures" WHERE upload_id = :id AND is_active = true`,
         { replacements: { id: req.params.id }, type: QueryTypes.SELECT }
     );
-    res.status(200).json({ success: true, count: rows.length, ...toFeatureCollection(rows) });
+
+    res.status(200).json({ success: true, count: rows.length, areas: spread, ...toFeatureCollection(rows) });
 });
 
 // Shared status-transition helper for a batch's features + the batch row.
