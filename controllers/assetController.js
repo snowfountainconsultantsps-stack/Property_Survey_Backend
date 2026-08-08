@@ -5,6 +5,7 @@ const {
     AssetLayer,
     AssetFeature,
     Polygon,
+    Project,
     Ward,
 } = require("../models");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -18,6 +19,7 @@ const {
     rowToFeature,
 } = require("../services/assetGeo");
 const { createPolygonFromFeature } = require("../services/polygonGeo");
+const { matchAreas, rematchFeatures } = require("../services/areaMatch");
 
 // ──────────────────────────────────────────────────────────────
 // Helpers
@@ -33,6 +35,27 @@ function bboxClause(bbox, repl) {
     repl.maxx = b[2];
     repl.maxy = b[3];
     return "ST_Intersects(f.geom, ST_MakeEnvelope(:minx, :miny, :maxx, :maxy, 4326))";
+}
+
+/**
+ * Area filters (zone / ward / locality), pushed onto a WHERE list.
+ *
+ * Every feature is stamped with all three at import time
+ * (services/areaMatch.js), so filtering by zone doesn't have to expand the
+ * zone into its wards first — which also means a zone filter still works for
+ * a feature whose ward boundary is missing.
+ */
+function areaFilters(query = {}, where, repl) {
+    for (const col of ["zone_id", "ward_id", "locality_id"]) {
+        const value = query[col];
+        if (value === undefined || value === null || value === "") continue;
+        // Comma-separated ids are accepted so the UI can filter by several
+        // wards at once without N requests.
+        const ids = String(value).split(",").map((v) => Number(v.trim())).filter(Number.isFinite);
+        if (!ids.length) continue;
+        where.push(`f.${col} IN (:${col})`);
+        repl[col] = ids;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -150,10 +173,10 @@ const deleteLayer = asyncHandler(async (req, res) => {
 // FEATURES — read as GeoJSON
 // ══════════════════════════════════════════════════════════════
 
-// GET /api/assets/layers/:id/features?status=&ward_id=&bbox=
+// GET /api/assets/layers/:id/features?status=&zone_id=&ward_id=&locality_id=&bbox=
 // Returns a GeoJSON FeatureCollection for one layer.
 const getLayerFeatures = asyncHandler(async (req, res) => {
-    const { status, ward_id, project_id, bbox } = req.query;
+    const { status, project_id, bbox } = req.query;
     const where = ["f.is_active = true", "f.layer_id = :layer_id"];
     const repl = { layer_id: req.params.id };
 
@@ -161,10 +184,7 @@ const getLayerFeatures = asyncHandler(async (req, res) => {
         where.push("f.status = :status");
         repl.status = status;
     }
-    if (ward_id) {
-        where.push("f.ward_id = :ward_id");
-        repl.ward_id = ward_id;
-    }
+    areaFilters(req.query, where, repl);
     if (project_id) {
         where.push("f.project_id = :project_id");
         repl.project_id = project_id;
@@ -203,7 +223,7 @@ const getLayerFeatures = asyncHandler(async (req, res) => {
 //   • limit=N     → cap the features returned, with `truncated` in the
 //     response so the client can tell the user to zoom in. Pair with bbox.
 const getAssetMap = asyncHandler(async (req, res) => {
-    const { ward_id, project_id, bbox, status = "PUBLISHED", meta_only, limit } = req.query;
+    const { project_id, bbox, status = "PUBLISHED", meta_only, limit } = req.query;
 
     const layers = await AssetLayer.findAll({
         where: { is_active: true },
@@ -217,10 +237,7 @@ const getAssetMap = asyncHandler(async (req, res) => {
         where.push("f.status = :status");
         repl.status = status;
     }
-    if (ward_id) {
-        where.push("f.ward_id = :ward_id");
-        repl.ward_id = ward_id;
-    }
+    areaFilters(req.query, where, repl);
     if (project_id) {
         where.push("f.project_id = :project_id");
         repl.project_id = project_id;
@@ -388,10 +405,18 @@ const createFeature = asyncHandler(async (req, res) => {
     const layer = await AssetLayer.findByPk(layer_id);
     if (!layer) return res.status(404).json({ success: false, message: "Layer not found." });
 
+    // Drawn features get the same hierarchy stamp as imported ones, so a
+    // manually added manhole is filterable and assignable like the rest. An
+    // explicit ward_id in the body still wins.
+    const project = project_id ? await Project.findByPk(project_id) : null;
+    const [area] = await matchAreas(sequelize, [geometry], project);
+
     const id = await insertFeature(sequelize, {
         layer_id,
         project_id: project_id || null,
-        ward_id: ward_id || null,
+        zone_id: area.zone_id,
+        ward_id: ward_id || area.ward_id,
+        locality_id: area.locality_id,
         polygon_id: polygon_id || null,
         feature_code: feature_code || null,
         properties: properties || {},
@@ -425,8 +450,16 @@ const updateFeature = asyncHandler(async (req, res) => {
     if (polygon_id !== undefined) patch.polygon_id = polygon_id;
     if (Object.keys(patch).length) await feature.update(patch);
 
-    // Geometry via raw SQL.
-    if (geometry) await updateFeatureGeometry(sequelize, feature.id, geometry);
+    // Geometry via raw SQL. Moving a feature can move it into another ward, so
+    // re-stamp the hierarchy unless the caller set the ward explicitly in the
+    // same request.
+    if (geometry) {
+        await updateFeatureGeometry(sequelize, feature.id, geometry);
+        if (ward_id === undefined) {
+            const project = feature.project_id ? await Project.findByPk(feature.project_id) : null;
+            await rematchFeatures(sequelize, { featureId: feature.id, project, overwrite: true });
+        }
+    }
 
     const rows = await sequelize.query(
         `SELECT ${FEATURE_SELECT} FROM "AssetFeatures" f WHERE f.id = :id`,
@@ -497,12 +530,22 @@ const ensureFeaturePolygon = asyncHandler(async (req, res) => {
         if (existing) return res.status(200).json(await withSurveyStatus(existing));
     }
 
-    // Polygons.ward_id is NOT NULL, so the parcel must carry a ward.
+    // A property survey needs the parcel's ward. Features imported before the
+    // spatial stamp exists (or before their ward boundary was imported) can
+    // still carry a NULL, so try matching this one from its own geometry
+    // before refusing — the surveyor is standing on the parcel, and a
+    // re-upload is not a reasonable thing to ask of them.
+    if (!feature.ward_id) {
+        const project = feature.project_id ? await Project.findByPk(feature.project_id) : null;
+        await rematchFeatures(sequelize, { featureId: feature.id, project });
+        await feature.reload();
+    }
     if (!feature.ward_id) {
         return res.status(400).json({
             success: false,
             message:
-                "This parcel has no ward assigned, which a property survey requires. Re-upload the property layer with a ward selected.",
+                "This parcel does not fall inside any ward boundary, which a property survey requires. " +
+                "Import the ward boundaries for this ULB, then re-match the upload.",
         });
     }
     const ward = await Ward.findByPk(feature.ward_id);
@@ -528,6 +571,8 @@ const ensureFeaturePolygon = asyncHandler(async (req, res) => {
             {
                 featureId: feature.id,
                 ward_id: feature.ward_id,
+                zone_id: feature.zone_id || null,
+                locality_id: feature.locality_id || null,
                 project_id: feature.project_id || null,
                 wardTag: ward.ward_number || String(ward.id),
             },
@@ -562,7 +607,7 @@ const FILTER_OPS = {
 // latest approved survey answers, so a filter reflects what the surveyor found
 // rather than only what the shapefile shipped with.
 const searchFeaturesByAttributes = asyncHandler(async (req, res) => {
-    const { layer_id, project_id, ward_id, status, filters = [], limit = 500 } = req.body || {};
+    const { layer_id, project_id, status, filters = [], limit = 500 } = req.body || {};
     if (!layer_id) {
         return res.status(400).json({ success: false, message: "layer_id is required." });
     }
@@ -578,10 +623,7 @@ const searchFeaturesByAttributes = asyncHandler(async (req, res) => {
         where.push("f.project_id = :project_id");
         repl.project_id = project_id;
     }
-    if (ward_id) {
-        where.push("f.ward_id = :ward_id");
-        repl.ward_id = ward_id;
-    }
+    areaFilters(req.body || {}, where, repl);
     if (status) {
         where.push("f.status = :status");
         repl.status = status;
@@ -663,15 +705,13 @@ const searchFeaturesByAttributes = asyncHandler(async (req, res) => {
 // STATS — per-layer inventory (feeds dashboards + PDF report)
 // ══════════════════════════════════════════════════════════════
 
-// GET /api/assets/stats?ward_id=
+// GET /api/assets/stats?zone_id=&ward_id=&locality_id=&project_id=
 const getAssetStats = asyncHandler(async (req, res) => {
-    const { ward_id, project_id } = req.query;
+    const { project_id } = req.query;
     const repl = {};
-    const filters = [];
-    if (ward_id) {
-        filters.push("AND f.ward_id = :ward_id");
-        repl.ward_id = ward_id;
-    }
+    const areaWhere = [];
+    areaFilters(req.query, areaWhere, repl);
+    const filters = areaWhere.map((c) => `AND ${c}`);
     if (project_id) {
         filters.push("AND f.project_id = :project_id");
         repl.project_id = project_id;

@@ -226,6 +226,33 @@ const startServer = async () => {
             console.warn("⚠️  Location boundary migration skipped:", e.message);
         }
 
+        // ── Area stamping: zone/locality alongside the existing ward ──
+        // Uploads resolve the whole hierarchy by spatial join now
+        // (services/areaMatch.js), so features and parcels carry the zone and
+        // locality they fall in, not just a hand-picked ward. Indexed because
+        // the map, the ward/zone filters and surveyor scoping all read them.
+        try {
+            for (const tbl of ["AssetFeatures", "Polygons"]) {
+                for (const col of ["zone_id", "locality_id"]) {
+                    await sequelize.query(
+                        `ALTER TABLE "${tbl}" ADD COLUMN IF NOT EXISTS "${col}" INTEGER;`
+                    );
+                }
+            }
+            for (const idx of [
+                ["asset_features_ward_idx", '"AssetFeatures" (ward_id)'],
+                ["asset_features_zone_idx", '"AssetFeatures" (zone_id)'],
+                ["asset_features_locality_idx", '"AssetFeatures" (locality_id)'],
+                ["polygons_ward_idx", '"Polygons" (ward_id)'],
+                ["polygons_zone_idx", '"Polygons" (zone_id)'],
+            ]) {
+                await sequelize.query(`CREATE INDEX IF NOT EXISTS "${idx[0]}" ON ${idx[1]};`).catch(() => {});
+            }
+            console.log("✅ Area stamping columns/indexes ready.");
+        } catch (e) {
+            console.warn("⚠️  Area stamping migration skipped:", e.message);
+        }
+
         // ── Project scoping: additive project_id on existing tables ──
         // (sync runs alter:false, so these columns are not auto-added.)
         try {

@@ -30,7 +30,10 @@ const TO_LEGACY_UTM = (expr) => `ST_SetSRID(ST_Multi(ST_Transform(${expr}, 32644
  * @returns {Promise<{id:number, polygon_code:string}>}
  */
 async function insertPolygon(sequelize, data, transaction) {
-    const { ward_id, project_id = null, geometry, polygon_code = null, wardTag } = data;
+    const {
+        ward_id, zone_id = null, locality_id = null,
+        project_id = null, geometry, polygon_code = null, wardTag,
+    } = data;
 
     const rows = await sequelize.query(
         `
@@ -45,12 +48,12 @@ async function insertPolygon(sequelize, data, transaction) {
           FROM src
         )
         INSERT INTO "Polygons"
-          (id, polygon_code, ward_id, project_id, boundary, area_sqmt, gis_status,
-           is_active, "createdAt", "updatedAt")
+          (id, polygon_code, ward_id, zone_id, locality_id, project_id, boundary, area_sqmt,
+           gis_status, is_active, "createdAt", "updatedAt")
         SELECT
           g.id,
           COALESCE(:polygon_code, 'PLY/' || :ward_tag || '/' || lpad(g.id::text, 6, '0')),
-          :ward_id, :project_id, g.boundary, g.area_sqmt,
+          :ward_id, :zone_id, :locality_id, :project_id, g.boundary, g.area_sqmt,
           'RAW', true, NOW(), NOW()
         FROM g
         RETURNING id, polygon_code;
@@ -60,6 +63,8 @@ async function insertPolygon(sequelize, data, transaction) {
                 geom: JSON.stringify(geometry),
                 polygon_code,
                 ward_id,
+                zone_id,
+                locality_id,
                 project_id,
                 ward_tag: wardTag,
             },
@@ -82,7 +87,11 @@ async function insertPolygon(sequelize, data, transaction) {
  *
  * @returns {Promise<{id:number, polygon_code:string, area_sqmt:number}>}
  */
-async function createPolygonFromFeature(sequelize, { featureId, ward_id, project_id = null, wardTag }, transaction) {
+async function createPolygonFromFeature(
+    sequelize,
+    { featureId, ward_id, zone_id = null, locality_id = null, project_id = null, wardTag },
+    transaction
+) {
     const rows = await sequelize.query(
         `
         WITH f AS (
@@ -96,18 +105,20 @@ async function createPolygonFromFeature(sequelize, { featureId, ward_id, project
           FROM f
         )
         INSERT INTO "Polygons"
-          (id, polygon_code, ward_id, project_id, boundary, area_sqmt, gis_status,
-           is_active, "createdAt", "updatedAt")
+          (id, polygon_code, ward_id, zone_id, locality_id, project_id, boundary, area_sqmt,
+           gis_status, is_active, "createdAt", "updatedAt")
         SELECT
           g.id,
           'PLY/' || :ward_tag || '/' || lpad(g.id::text, 6, '0'),
-          :ward_id, :project_id, g.boundary, g.area_sqmt,
+          :ward_id, :zone_id, :locality_id, :project_id, g.boundary, g.area_sqmt,
           'RAW', true, NOW(), NOW()
         FROM g
         RETURNING id, polygon_code, area_sqmt;
         `,
         {
-            replacements: { feature_id: featureId, ward_id, project_id, ward_tag: wardTag },
+            replacements: {
+                feature_id: featureId, ward_id, zone_id, locality_id, project_id, ward_tag: wardTag,
+            },
             type: QueryTypes.SELECT,
             transaction,
         }

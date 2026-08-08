@@ -26,9 +26,18 @@ module.exports = (sequelize, DataTypes) => {
         // Project this feature belongs to (set at import time).
         project_id: DataTypes.INTEGER,
 
-        // Optional area scoping. A feature can belong to a ward and/or sit
-        // inside a parcel polygon (filled in by a spatial join if desired).
+        // Where this feature falls in the location hierarchy. Stamped at import
+        // time by a spatial join against the boundaries
+        // (services/areaMatch.js) rather than chosen by the uploader, since a
+        // bulk file crosses many wards. All three are nullable: a locality is
+        // optional by design, and a feature outside every known boundary keeps
+        // NULLs rather than being forced into the wrong area.
+        zone_id: DataTypes.INTEGER,
         ward_id: DataTypes.INTEGER,
+        locality_id: DataTypes.INTEGER,
+
+        // Parcel polygon this feature sits in, when it has been bridged for a
+        // property survey.
         polygon_id: DataTypes.INTEGER,
 
         // Human/asset reference code, e.g. "MH-0142". Not unique globally.

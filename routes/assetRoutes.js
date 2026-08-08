@@ -58,6 +58,9 @@ router.post(
 router.get("/uploads", auth, GIS_ADMIN, uploads.listUploads);
 router.get("/uploads/:id", auth, GIS_ADMIN, uploads.getUpload);
 router.get("/uploads/:id/features", auth, GIS_ADMIN, uploads.getUploadFeatures);
+// Re-stamp zone/ward/locality from geometry — for batches imported before the
+// spatial match existed, or after boundaries were (re)imported.
+router.post("/uploads/:id/match-areas", auth, GIS_ADMIN, uploads.matchUploadAreas);
 router.post("/uploads/:id/verify", auth, GIS_ADMIN, uploads.verifyUpload);
 router.post("/uploads/:id/publish", auth, GIS_ADMIN, uploads.publishUpload);
 router.post("/uploads/:id/reject", auth, GIS_ADMIN, uploads.rejectUpload);

@@ -16,7 +16,9 @@ const FEATURE_SELECT = `
   f.id,
   f.layer_id,
   f.project_id,
+  f.zone_id,
   f.ward_id,
+  f.locality_id,
   f.polygon_id,
   f.feature_code,
   f.properties,
@@ -59,7 +61,9 @@ async function insertFeature(sequelize, data, transaction) {
     const {
         layer_id,
         project_id = null,
+        zone_id = null,
         ward_id = null,
+        locality_id = null,
         polygon_id = null,
         feature_code = null,
         properties = {},
@@ -79,11 +83,13 @@ async function insertFeature(sequelize, data, transaction) {
           SELECT ST_Force2D(ST_SetSRID(ST_GeomFromGeoJSON(:geom), 4326)) AS geom
         )
         INSERT INTO "AssetFeatures"
-          (layer_id, project_id, ward_id, polygon_id, feature_code, properties, source, status,
+          (layer_id, project_id, zone_id, ward_id, locality_id, polygon_id, feature_code,
+           properties, source, status,
            upload_id, created_by, surveyor_id, geom, length_m, area_sqm,
            is_active, "createdAt", "updatedAt")
         SELECT
-          :layer_id, :project_id, :ward_id, :polygon_id, :feature_code, CAST(:properties AS JSONB),
+          :layer_id, :project_id, :zone_id, :ward_id, :locality_id, :polygon_id, :feature_code,
+          CAST(:properties AS JSONB),
           :source, :status, :upload_id, :created_by, :surveyor_id, g.geom,
           CASE WHEN GeometryType(g.geom) LIKE '%LINESTRING%' THEN ST_Length(g.geom::geography) END,
           CASE WHEN GeometryType(g.geom) LIKE '%POLYGON%'    THEN ST_Area(g.geom::geography)   END,
@@ -95,7 +101,9 @@ async function insertFeature(sequelize, data, transaction) {
             replacements: {
                 layer_id,
                 project_id,
+                zone_id,
                 ward_id,
+                locality_id,
                 polygon_id,
                 feature_code,
                 properties: JSON.stringify(properties || {}),
@@ -133,7 +141,9 @@ async function insertFeaturesBulk(sequelize, features, transaction, chunkSize = 
         const tuples = chunk.map((d, i) => {
             replacements[`layer_id${i}`] = d.layer_id;
             replacements[`project_id${i}`] = d.project_id ?? null;
+            replacements[`zone_id${i}`] = d.zone_id ?? null;
             replacements[`ward_id${i}`] = d.ward_id ?? null;
+            replacements[`locality_id${i}`] = d.locality_id ?? null;
             replacements[`polygon_id${i}`] = d.polygon_id ?? null;
             replacements[`feature_code${i}`] = d.feature_code ?? null;
             replacements[`properties${i}`] = JSON.stringify(d.properties || {});
@@ -146,7 +156,8 @@ async function insertFeaturesBulk(sequelize, features, transaction, chunkSize = 
             // Explicit casts: Postgres infers VALUES column types from the
             // first row, so untyped NULLs would otherwise break the insert.
             return `(
-                :layer_id${i}::integer, :project_id${i}::integer, :ward_id${i}::integer,
+                :layer_id${i}::integer, :project_id${i}::integer, :zone_id${i}::integer,
+                :ward_id${i}::integer, :locality_id${i}::integer,
                 :polygon_id${i}::integer, :feature_code${i}::varchar,
                 CAST(:properties${i} AS JSONB),
                 :source${i}::"enum_AssetFeatures_source",
@@ -160,16 +171,19 @@ async function insertFeaturesBulk(sequelize, features, transaction, chunkSize = 
 
         const rows = await sequelize.query(
             `
-            WITH v (layer_id, project_id, ward_id, polygon_id, feature_code, properties,
+            WITH v (layer_id, project_id, zone_id, ward_id, locality_id, polygon_id,
+                    feature_code, properties,
                     source, status, upload_id, created_by, surveyor_id, geom, ordinal) AS (
               VALUES ${tuples.join(",")}
             )
             INSERT INTO "AssetFeatures"
-              (layer_id, project_id, ward_id, polygon_id, feature_code, properties, source, status,
+              (layer_id, project_id, zone_id, ward_id, locality_id, polygon_id, feature_code,
+               properties, source, status,
                upload_id, created_by, surveyor_id, geom, length_m, area_sqm,
                is_active, "createdAt", "updatedAt")
             SELECT
-              v.layer_id, v.project_id, v.ward_id, v.polygon_id, v.feature_code, v.properties,
+              v.layer_id, v.project_id, v.zone_id, v.ward_id, v.locality_id, v.polygon_id,
+              v.feature_code, v.properties,
               v.source, v.status, v.upload_id, v.created_by, v.surveyor_id, v.geom,
               CASE WHEN GeometryType(v.geom) LIKE '%LINESTRING%' THEN ST_Length(v.geom::geography) END,
               CASE WHEN GeometryType(v.geom) LIKE '%POLYGON%'    THEN ST_Area(v.geom::geography)   END,
@@ -255,7 +269,9 @@ function rowToFeature(row) {
             id: row.id,
             layer_id: row.layer_id,
             project_id: row.project_id,
+            zone_id: row.zone_id,
             ward_id: row.ward_id,
+            locality_id: row.locality_id,
             polygon_id: row.polygon_id,
             feature_code: row.feature_code,
             source: row.source,

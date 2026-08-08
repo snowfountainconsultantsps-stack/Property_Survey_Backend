@@ -3,6 +3,7 @@ const { sequelize, AssetLayer, AssetUpload, AssetFeature, Project, Ward } = requ
 const { asyncHandler } = require("../middleware/errorHandler");
 const { parseUpload, GEOM_FAMILY } = require("../services/shapefileService");
 const { FEATURE_SELECT, insertFeaturesBulk, toFeatureCollection } = require("../services/assetGeo");
+const { matchAreas, rematchFeatures, summarise } = require("../services/areaMatch");
 
 // Common .dbf/GeoJSON property keys that tend to hold an asset reference code.
 const CODE_KEYS = ["feature_code", "code", "asset_code", "ref", "name", "id_no", "gid", "objectid", "fid"];
@@ -62,14 +63,33 @@ const uploadAssetData = asyncHandler(async (req, res) => {
         });
     }
 
-    // 3. Create the batch + stage features in one transaction.
-    const ward_id = req.body.ward_id ? Number(req.body.ward_id) : null;
-    if (ward_id) {
-        const ward = await Ward.findByPk(ward_id);
-        if (!ward) {
-            return res.status(400).json({ success: false, message: `Ward ${ward_id} not found.` });
+    // 3. Work out where each feature falls in the hierarchy from its own
+    //    geometry. A bulk file spans a whole ULB, so one ward for the batch was
+    //    wrong for most of it — and a NULL ward makes the feature invisible to
+    //    every scoped surveyor (services/surveyorScope.js).
+    //    `ward_id` in the body is now only a fallback for features that land
+    //    outside every known boundary (or when no boundaries are imported yet).
+    const fallback_ward_id = req.body.ward_id ? Number(req.body.ward_id) : null;
+    let fallbackWard = null;
+    if (fallback_ward_id) {
+        fallbackWard = await Ward.findByPk(fallback_ward_id);
+        if (!fallbackWard) {
+            return res.status(400).json({ success: false, message: `Ward ${fallback_ward_id} not found.` });
         }
     }
+
+    const matches = await matchAreas(sequelize, matching.map((f) => f.geometry), project);
+    if (fallbackWard) {
+        for (const m of matches) {
+            if (!m.ward_id) {
+                m.ward_id = fallbackWard.id;
+                m.zone_id = m.zone_id ?? fallbackWard.zone_id ?? null;
+            }
+        }
+    }
+    const areaStats = summarise(matches);
+
+    // 4. Create the batch + stage features in one transaction.
     const result = await sequelize.transaction(async (t) => {
         const upload = await AssetUpload.create(
             {
@@ -93,7 +113,9 @@ const uploadAssetData = asyncHandler(async (req, res) => {
         const rows = matching.map((f, idx) => ({
             layer_id: layer.id,
             project_id,
-            ward_id,
+            zone_id: matches[idx].zone_id,
+            ward_id: matches[idx].ward_id,
+            locality_id: matches[idx].locality_id,
             // Fall back to a batch-scoped unique code (layer + upload + sequence)
             // when the source file has no usable code attribute — guaranteed
             // unique since upload.id is a fresh PK and the index is per-batch.
@@ -112,9 +134,21 @@ const uploadAssetData = asyncHandler(async (req, res) => {
         return upload;
     });
 
+    // An unmatched count is worth saying out loud: those features carry no
+    // ward, so they won't appear under any ward filter or surveyor allocation
+    // until the boundaries that cover them are imported.
+    const areaNote = areaStats.matched
+        ? ` Matched ${areaStats.matched} to ${areaStats.wards_touched} ward(s)` +
+          `${areaStats.zones_touched ? `, ${areaStats.zones_touched} zone(s)` : ""}` +
+          `${areaStats.localities_touched ? `, ${areaStats.localities_touched} locality(ies)` : ""}.` +
+          `${areaStats.unmatched ? ` ${areaStats.unmatched} fell outside every ward boundary.` : ""}`
+        : ` No feature fell inside a known ward boundary — import the ward boundaries for this ULB, then re-match this batch.`;
+
     res.status(201).json({
         success: true,
-        message: `Imported ${matching.length} feature(s) into staging.${skipped ? ` ${skipped} skipped (geometry mismatch).` : ""}`,
+        message:
+            `Imported ${matching.length} feature(s) into staging.` +
+            `${skipped ? ` ${skipped} skipped (geometry mismatch).` : ""}${areaNote}`,
         data: {
             upload_id: result.id,
             layer: { id: layer.id, name: layer.name, geometry_type: layer.geometry_type },
@@ -122,7 +156,47 @@ const uploadAssetData = asyncHandler(async (req, res) => {
             skipped,
             bbox: parsed.bbox,
             source_format: parsed.format,
+            areas: areaStats,
         },
+    });
+});
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/assets/uploads/:id/match-areas   (admin / GIS)
+// Re-run the spatial hierarchy match over a batch already in the table — for
+// features imported before this existed, or after the ward/zone/locality
+// boundaries were (re)imported. Only fills gaps unless ?overwrite=1, so a
+// ward corrected by hand on one feature survives a bulk re-run.
+// ──────────────────────────────────────────────────────────────
+const matchUploadAreas = asyncHandler(async (req, res) => {
+    const upload = await AssetUpload.findByPk(req.params.id);
+    if (!upload) return res.status(404).json({ success: false, message: "Upload not found." });
+
+    const project = upload.project_id ? await Project.findByPk(upload.project_id) : null;
+    const overwrite = req.query.overwrite === "1" || req.query.overwrite === "true";
+
+    const { updated } = await rematchFeatures(sequelize, {
+        uploadId: upload.id,
+        project,
+        overwrite,
+    });
+
+    const [stats] = await sequelize.query(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(ward_id)::int AS with_ward,
+                COUNT(DISTINCT ward_id)::int AS wards,
+                COUNT(DISTINCT zone_id)::int AS zones,
+                COUNT(DISTINCT locality_id)::int AS localities
+         FROM "AssetFeatures" WHERE upload_id = :id AND is_active = true`,
+        { replacements: { id: upload.id }, type: QueryTypes.SELECT }
+    );
+
+    res.status(200).json({
+        success: true,
+        message:
+            `Re-matched ${updated} feature(s). ` +
+            `${stats.with_ward}/${stats.total} now carry a ward across ${stats.wards} ward(s).`,
+        data: { updated, ...stats },
     });
 });
 
@@ -239,6 +313,7 @@ const deleteUpload = asyncHandler(async (req, res) => {
 
 module.exports = {
     uploadAssetData,
+    matchUploadAreas,
     listUploads,
     getUpload,
     getUploadFeatures,

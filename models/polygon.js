@@ -12,12 +12,15 @@ module.exports = (sequelize, DataTypes) => {
         },
 
         // Nullable so a parcel can exist while the location hierarchy is being
-        // rebuilt (see scripts/resetLocations.js). Uploads still require a
-        // ward — that is enforced in the controller, not the column.
+        // rebuilt (see scripts/resetLocations.js). Uploads stamp these from the
+        // parcel's own geometry (services/areaMatch.js) instead of applying one
+        // hand-picked ward to the whole file.
         ward_id: {
             type: DataTypes.INTEGER,
             allowNull: true,
         },
+        zone_id: DataTypes.INTEGER,
+        locality_id: DataTypes.INTEGER,
 
         // Project this parcel belongs to (nullable — legacy data has none).
         project_id: DataTypes.INTEGER,
